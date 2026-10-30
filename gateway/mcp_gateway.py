@@ -346,23 +346,23 @@ def _retry_on_conflict(fn):
 def _update_profile_locked(student_id: int, fields: dict, weak_add: list[str] | None):
     # v1.5（三轮评审）：内容与 version 必须来自同一次 SELECT——
     # 分两次读会拿到"最新版本号+旧内容"，条件更新反而成功，Lost Update 复活
+    # v1.7（五轮评审）：首建档不再走无版本路径——无行时版本按 1 处理，
+    # 统一走"INSERT IGNORE 原子建行 + 条件 UPDATE"（并发首写由乐观锁仲裁，
+    # 败者 MemoryConflict → _retry_on_conflict 重读合并），ver=None 覆盖窗口消除
     mem = db.get_student_memory(student_id) or {}
-    ver = mem.get("version")
-    if ver is not None:
-        if weak_add:
-            weak = _load_json(mem.get("weak_topics"))
+    ver = mem.get("version", 1)
+    if weak_add:
+        weak = _load_json(mem.get("weak_topics"))
+        if weak:
             for t in weak_add:
                 weak = _merge_weak_topics(weak, t, None)
             fields = {**fields, "weak_topics": weak}
-        db.upsert_student_memory(student_id, expected_version=ver, **fields)
-    else:
-        # 新学生首次建档：weak_topics 合并逻辑同样执行（v1.5 修复：
-        # 原实现 ver 为 None 时直接 upsert fields，首次传入的 weak_topics 会丢失）
-        if weak_add:
+        else:
+            # 首建档（v1.5 修复保留：weak_topics 归一化在版本判断外，不丢失）
             fields = {**fields,
                       "weak_topics": [{"topic": t.strip(), "status": "open"}
                                       for t in weak_add if t.strip()]}
-        db.upsert_student_memory(student_id, **fields)
+    db.upsert_student_memory(student_id, expected_version=ver, **fields)
 
 
 def tool_update_profile(student_id: int, args: dict) -> dict:
@@ -378,7 +378,6 @@ def tool_update_profile(student_id: int, args: dict) -> dict:
 def _save_memory_locked(student_id: int, args: dict) -> dict:
     # v1.5：mem 与 version 同源（单次 SELECT * 包含 version 列）
     mem = db.get_student_memory(student_id) or {}
-    ver = mem.get("version")
     weak = _load_json(mem.get("weak_topics"))
     taught = _load_json(mem.get("taught_topics"))
     patch: dict = {}
@@ -400,10 +399,9 @@ def _save_memory_locked(student_id: int, args: dict) -> dict:
         merged = (base + "\n" + args["summary_patch"].strip()).strip()
         patch["summary"] = merged[-2000:]  # 超限保留尾部（近因优先）
     if patch:
-        if ver is not None:
-            db.upsert_student_memory(student_id, expected_version=ver, **patch)
-        else:
-            db.upsert_student_memory(student_id, **patch)
+        # v1.7：无行时版本按 1，统一走原子建行+条件更新（与 v1.5 同源读取衔接）
+        db.upsert_student_memory(student_id, expected_version=mem.get("version", 1),
+                                 **patch)
     if args.get("session_id") and args.get("digest"):
         db.add_dialogue(student_id, args["session_id"], "student", args["digest"])
     return {"ok": True, "merged_fields": list(patch.keys())}
@@ -458,15 +456,12 @@ def _auto_solve_on_repeat_success(student_id: int, qid: str):
     if not topic:
         return
     mem = db.get_student_memory(student_id) or {}
-    ver = mem.get("version")  # v1.5：与内容同源
+    ver = mem.get("version", 1)  # v1.5 同源读取；v1.7 无行按 1，不再走无版本路径
     weak = _load_json(mem.get("weak_topics"))
     merged = _merge_weak_topics(weak, None, topic)
     if merged != weak:
-        if ver is not None:
-            db.upsert_student_memory(student_id, expected_version=ver,
-                                     weak_topics=merged)
-        else:
-            db.upsert_student_memory(student_id, weak_topics=merged)
+        db.upsert_student_memory(student_id, expected_version=ver,
+                                 weak_topics=merged)
 
 
 def tool_list_mistakes(student_id: int, args: dict) -> dict:

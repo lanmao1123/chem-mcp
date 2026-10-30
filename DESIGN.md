@@ -1,6 +1,6 @@
 # chem-mcp 技术方案与设计背景
 
-> 版本：v1.6 ｜ 更新：2026-10-30（四轮外部评审修复：文档全量对账/发布同步 fail-closed 门禁/首建档并发边界声明） ｜ 状态：生产运行中（单实例试点规模）
+> 版本：v1.7 ｜ 更新：2026-10-30（五轮评审修复：首建档并发原子化/章节级扫描豁免/动态对账/manifest 固定清单与 --verify blob 对账） ｜ 状态：生产运行中（单实例试点规模）
 > 本文档面向审查者：完整交代项目背景、要解决的问题、每个关键设计决策的动机、已知取舍与未解决问题。配套代码全部在本仓库内。
 
 ---
@@ -139,7 +139,7 @@ WHERE student_id=%s AND version=%s    -- rowcount==0 → 冲突
 
 网关侧 `_retry_on_conflict` 装饰器：冲突自动重读重试（≤3 次，50ms 退避），仍失败返回 409。测试通过 monkeypatch 在工具执行中途插队推进版本，验证重试收敛且两个写者的 weak_topics 都保留（无丢失）。
 
-单写者场景（当前试点：一个学生一个连接器）用无锁路径（`expected_version=None`），行为与 v1.2 兼容。该假设的边界与首建档并发风险见 §5t.3 与路线图 #12。
+单写者场景（当前试点：一个学生一个连接器）的边界问题已随 v1.7 首建档原子化关闭（§5t.3）：现在无论单写还是并发，所有 Memory 写入都经版本条件更新。
 
 ### 3.5 get_profile 输出治理（v1.3 重写）
 
@@ -218,7 +218,7 @@ MySQL              = 状态层：唯一真相
 | 9 | 测试依赖真实 MySQL，无 CI | 37 用例本地跑 | **P1**：单测/集成分离 + GitHub Actions |
 | 10 | dialogue_log 写入无独立幂等键 | 低危（摘要重复无资损） | **P1**：统一 operation_id 幂等框架 |
 | 11 | class_summary 无班级边界（teacher 见全表） | 试点期教师=管理员 | **P1**：teacher_classes 关联 + 查询强制带边界 |
-| 12 | Memory 首建档（ver=None）并发首写无版本保护，多会话并发下可互相覆盖 | 单学生单连接器假设下不可达；详见 §5t.3 | **P2**：允许同学生多会话并发前实现"原子建行→重读版本→条件更新"，届时升 P1 |
+| 12 | ~~Memory 首建档（ver=None）并发首写无版本保护~~ | **v1.7 已修复**：无行按 version=1 统一走原子建行+条件更新，见 §5t.3 | 关闭（并发测试锁定） |
 
 ## 5. 二轮评审修复记录（v1.4，2026-10-30）
 
@@ -232,7 +232,7 @@ MySQL              = 状态层：唯一真相
 
 | # | 指控 | 核实 | 处置 |
 |---|---|---|---|
-| 1 | v1.3 四项修复未接入仓库网关/测试 | ✅ **属实（同步事故）** | 仓库全量同步至生产版本（`gateway/mcp_gateway.py`、`tests/` 逐字节一致），33/33 测试在仓库 import 路径下通过 |
+| 1 | v1.3 四项修复未接入仓库网关/测试 | ✅ **属实（同步事故）** | 仓库全量同步至生产版本（`gateway/mcp_gateway.py`、`tests/` 逐字节一致），v1.4 当时的 33/33 测试在仓库 import 路径下通过（历史记录：v1.5 起 37 个，v1.7 起 38 个） |
 | 2 | 缺 `save_report`：报告生成后无处持久化，数据闭环断裂 | ✅ 属实 | **新增第 9 个工具**：`save_report(report_type, content_md, report_key)`，`UNIQUE(student_id, report_key)` 原子幂等（Agent 重试只落一份）；专家提示词同步规则"**必须等 save_report 返回成功才能宣称已存档**" |
 | 3 | 限流计数 SELECT→INSERT 非原子，并发可穿越配额 | ✅ 属实 | **部分修**：已改 insert-before-count 并修正边界为"计数 > 限额"；但三轮评审指出 InnoDB REPEATABLE READ 下未提交 INSERT 对并发事务不可见，仍可穿透配额 → **v1.5 已改行锁串行化**（见 §5bis），本项至此真正修复 |
 | 4 | Expert Prompt 与工具 schema 不一致（save_memory 无 target_grade 参数；报告存档话术提前） | ✅ 属实 | **已修**：提示词明确"目标等级/分数段/卷型变化走 update_profile"；报告存档流程改为"save_report 成功后才宣称" |
@@ -327,16 +327,62 @@ COMMIT;                                     -- 释放锁，后续请求可见已
 
 **仍需诚实声明的边界**：manifest 生成与生产对账之间是"推送-拉取"两步，脚本本身不能主动读生产机；对账命令已写入脚本输出提示，是否执行仍是人工流程。完全自动化需 CI/CD（路线图 #9）。
 
-### 5t.3 Memory 首建档并发边界（四轮新发现：明确记录为 P2，本轮不修代码）
+### 5t.3 Memory 首建档并发边界（四轮发现 P2 → **五轮已修复**）
 
-评审正确指出：三个 Memory 函数在 `ver is None`（尚无 Memory 行）时的写入路径没有版本保护——两个并发请求同时对无 Memory 记录的学生首次建档，可能互相覆盖（A 写 weak=[A]，B 写 weak=[B]，最终只留 B）。
+四轮评审正确指出：三个 Memory 函数在 `ver is None`（尚无 Memory 行）时的写入路径没有版本保护——两个并发请求同时对无 Memory 记录的学生首次建档，可能互相覆盖。
 
-**为什么本轮不改代码**：
-1. 当前生产约束是"一个学生一个 WorkBuddy 连接器"，同一学生的工具调用在平台侧天然串行，`ver is None` 并发首写在实际运行中不可达；
-2. v1.3/v1.5 的乐观锁已覆盖全部"已有行"的更新路径（评审本轮确认 PASS）；
-3. 首写覆盖的后果是低危的：两次都是合法的首次画像写入，合并语义本就以后到为准，无数据损毁，重新调用即恢复。
+五轮评审进一步质疑了"一个学生一个连接器 = 调用串行"的前提（**一个连接器不必然等于单请求，平台 single-flight 不可验证**），我们接受该质疑并直接实现修复（不再挂 P2）：
 
-**明确的升级条件与方案**（写入路线图 #12）：一旦允许同一学生多会话并发调用工具，必须先实现"原子建行 → 重读版本 → 条件更新"（INSERT 唯一键冲突后走带 expected_version 的路径），届时此问题从 P2 升为 P1。单写者假设从此有文档声明的边界，不再是无声的漏洞。
+**v1.7 修复：无行时版本按 1，统一走条件更新路径**
+
+```python
+ver = mem.get("version", 1)          # 无行视为 version=1
+db.upsert_student_memory(student_id, expected_version=ver, **fields)
+```
+
+db 层 `expected_version` 路径本身已是原子的：`INSERT IGNORE INTO student_memory(student_id, version) VALUES (%s, 1)` 原子建行 + `UPDATE ... WHERE student_id=%s AND version=%s` 条件写入，rowcount==0 抛 `MemoryConflict` → 网关 `_retry_on_conflict` 重读合并重试。并发首写的效果：A 建行并成功（version→2）；B 条件更新失败 → 重读 → 合并 A 的内容后再写。**两个写者的 weak_topics 都保留，ver=None 覆盖窗口消除**。三处（`_update_profile_locked`/`_save_memory_locked`/`_auto_solve_on_repeat_success`）全部统一。并发测试 `test_first_creation_concurrent_no_overwrite`（双线程 Barrier 同时 save_memory）锁定。
+
+---
+
+## 5quater. 五轮评审修复记录（v1.7，2026-10-30）
+
+第五轮审查结论"有条件放行"：P1 四项中三项 PASS；**扫描豁免 FAIL**（行级豁免过宽）、manifest 覆盖 PARTIAL、首建档"条件接受"（但质疑单连接器≠单请求）。全部处置如下：
+
+### 5q.1 DESIGN 扫描豁免改章节级（本轮主要 FAIL 修复）
+
+**漏洞（评审攻击样例成立）**：v1.6 的豁免按行首字符（`|`/`#`/`>`/README/教训…）判定，未检查所在章节——在 DESIGN 任意位置（如快速开始）插入 `> 生产启动命令：python -m app.mcp_gateway` 或表格行即可逃过扫描。另发现 `DESIGN_EXEMPT_LINE` 为未使用的死代码。
+
+**修复**：豁免改为**真正的章节级**——解析 Markdown 标题流，仅当行处于修复记录章节（`## 5.` / `## 5bis.` / `## 5ter.` / `## 5quater.` / `## 6.` 标题之后、下一个 H2 之前）才豁免；任何其他章节的 blockquote/表格/普通行命中旧串一律 FAIL。死代码已删除。自测：快速开始章节插入 `> 旧命令` 样例 → 扫描 FAIL（拦截）；修复记录章节内历史引用 → PASS（放行）。
+
+### 5q.2 动态对账取代"枚举旧版本正则"（评审：版本一致性应校验而非枚举）
+
+评审指出 v1.6 规则集漏报 `version-1.5`、`tests-36/36` 等"新的旧值"。修复为双保险：
+
+1. **动态对账（主）**：README 测试徽章必须精确等于 `tests-{CURRENT_TESTS}%2F{CURRENT_TESTS}`；README 版本徽章必须含 `version-{CURRENT_VERSION}`；DESIGN 头部版本行必须精确匹配 `> 版本：v{CURRENT_VERSION} `；测试函数数量必须等于基线；README 工具清单**解析后集合精确相等**（第 10 个未知工具会 FAIL）。任何回退/漂移都拦截，无需枚举。
+2. **兜底正则（辅）**：`tests-3[0-9]%2F3[0-9]`、`version-1.[0-7]` 等宽匹配规则兜底非徽章位置的残留。
+
+同时按评审建议把 import 残留检查升级为 **AST 扫描**（`ast.walk` 覆盖 `import app` / `from app.x import` / 函数内延迟导入等所有形态），不再依赖文本正则。
+
+### 5q.3 manifest 固定清单 + 专家包纳入 + --verify blob 对账
+
+| 评审问题 | 修复 |
+|---|---|
+| `MANIFEST_FILES` 导入时 `exists()` 静默过滤：目标文件被删→重新复制→仍不进 manifest | **固定必需清单**（10 个文件），生成前逐一校验存在性，缺失即 fail |
+| 专家包不在对账范围 | `expert-package/.codebuddy-plugin/plugin.json` 与 `expert-package/agents/cie-chem-coach.md` 纳入 manifest（修正了 v1.6 写错的仓库根 `plugin.json` 路径） |
+| `git_commit` 含义不明（02fc71b vs 1ba6734） | 字段改名 `release_commit`（生成时 HEAD），新增 `workspace_clean` 标志；dirty 时输出提示"commit 后必须 --verify" |
+| 脚本不校验工作区与 git tree 对应 | **新增 `--verify` 模式**：从 release commit 逐文件 `git show` 取 blob 重新计算 SHA-256 与 manifest 比对，不一致即非零退出。发布固化为三步：sync → commit → `--verify` |
+
+诚实声明（评审已指出，维持）：SHA-256 不是数字签名，manifest 与代码同仓提交，防的是"无意漂移"而非"恶意替换"；绕过脚本直接 cp+commit 目前仍无法被仓库侧强制（需 GitHub Actions required check，见路线图 #9——本轮已把门禁收敛为单脚本单命令，CI 化时原样搬进 workflow 即可）。
+
+### 5q.4 首建档并发：接受质疑，直接修复（不再 P2）
+
+评审正确指出"一个连接器不必然等于单请求"，平台 single-flight 不可验证，P2 依据不充分。v1.7 直接实现评审给出的最小方案（详见 §5t.3）：三处 Memory 写入统一 `ver = mem.get("version", 1)` 走 `INSERT IGNORE` 原子建行 + 条件 UPDATE，复用既有 `_retry_on_conflict`。新增并发测试 `test_first_creation_concurrent_no_overwrite`（38 用例）。
+
+### 5q.5 其他收尾
+
+- `.env` 注入优先级反转：先剥离 shell 中残留的 `MYSQL_*` 再注入 chemask `.env`（防止测试连到开发者 shell 里碰巧存在的另一套库）；运行前打印脱敏库目标（host:port/db，无密码）。
+- v1.4 表格中 `33/33` 标注为历史记录（"v1.4 当时的 33/33"），不篡改历史数字。
+- 评审提到的"绕过脚本直接提交"与"CI 强制"维持路线图 #9 既有结论，本轮未新增虚假声明。
 
 ---
 

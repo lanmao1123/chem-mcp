@@ -3,7 +3,7 @@
 > **学生召唤 WorkBuddy 专家 → MCP 网关（Token 硬身份）→ 数据层 → MySQL**
 > 让"专家记住学生"跨会话成立：长期记忆、作答流水、错题本、学情报告全部落自有数据库。
 
-[![tests](https://img.shields.io/badge/tests-37%2F37-brightgreen)]() [![protocol](https://img.shields.io/badge/MCP-compatible--JSON--RPC%20%2B%20SSE-blue)]() [![version](https://img.shields.io/badge/version-1.6-orange)]()
+[![tests](https://img.shields.io/badge/tests-38%2F38-brightgreen)]() [![protocol](https://img.shields.io/badge/MCP-compatible--JSON--RPC%20%2B%20SSE-blue)]() [![version](https://img.shields.io/badge/version-1.7-orange)]()
 
 ## 这是什么
 
@@ -13,9 +13,9 @@
 - **Token ↔ 学生硬绑定**：一人一 Token（只存 SHA-256），网关反查即知身份；**student_id 由网关注入，不信任 LLM 传参**（防跨学生数据泄露）
 - **9 个白名单工具**：get_profile / update_profile / save_memory / record_attempt（幂等） / list_mistakes / get_mastery / class_summary（仅教师 role） / get_report / save_report（幂等）
 - **长期记忆三层设计**：`student_memory` 一人一行摘要（增量合并：卡点并集、计划覆盖、taught_topics 防重复讲解）+ dialogue_log / attempts / reports 明细可回溯
-- **并发正确性**（v1.3/v1.5）：`record_attempt` 幂等由 `UNIQUE(student_id,qid,idem_key)` 原子保证；记忆更新走 version 乐观锁（内容与版本同源读取）+ 自动重试，杜绝并发 Lost Update；限流经 `FOR UPDATE` 行锁串行化，并发下不可穿越配额
+- **并发正确性**（v1.3/v1.5/v1.7）：`record_attempt` 幂等由 `UNIQUE(student_id,qid,idem_key)` 原子保证；记忆更新（含**并发首建档**）统一走"原子建行 + version 条件更新"（内容与版本同源读取）+ 自动重试，杜绝 Lost Update；限流经 `FOR UPDATE` 行锁串行化，并发下不可穿越配额
 - **输出治理**（v1.3/v1.5）：get_profile 结构化裁剪至 3K 字符硬上限（含终极兜底），**任何输入都返回合法 JSON**；报告全文按需经 get_report 拉取
-- **发布一致性**（v1.6）：`sync_from_chemask.py` fail-closed（源缺失即失败）+ 全量旧内容扫描 + SHA-256 清单 + pytest 发布门禁（见下文"发布同步机制"）
+- **发布一致性**（v1.6/v1.7）：`sync_from_chemask.py` fail-closed 门禁（源缺失即失败）+ 兜底正则 + **动态对账**（徽章/测试数/工具集合与基线精确相等）+ AST import 扫描 + pytest 门禁 + manifest（含专家包）+ `--verify` git blob 对账
 - **RBAC**（v1.3）：`api_keys.role` 正式权限列（student/teacher），替代字符串约定
 - **安全**：3306 永不出公网、凭据只在服务器 .env、限流只计业务调用（保活流量免计费）、Token 支持吊销/轮换
 
@@ -39,7 +39,7 @@ chem-mcp/
 │   ├── mcp_token.py          # Token 签发/吊销/列表 CLI（--role teacher；明文仅签发时展示一次）
 │   └── mcp_echo_server.py    # 平台连通性验证用 echo MCP（零业务依赖）
 ├── tests/
-│   └── test_mcp_gateway.py   # 37 用例：协议/鉴权/限流(仅业务计费)/并发幂等/JSON 合法性/乐观锁/RBAC/合并状态机
+│   └── test_mcp_gateway.py   # 38 用例：协议/鉴权/限流(仅业务计费)/并发幂等/JSON 合法性/乐观锁/并发首建档/RBAC/合并状态机
 ├── DESIGN.md                 # ★ 技术方案与设计背景（审查者从这里开始）
 └── README.md                 # 本文件
 ```
@@ -87,10 +87,11 @@ python -m pytest tests/ -q
 代码的真实来源是 `../chemask` 工作区；本仓库是面向审查的发布视图。**每次发布必须**：
 
 ```bash
-python3 sync_from_chemask.py   # 同步 + import 改写 + 旧内容扫描 + SHA-256 清单 + pytest 门禁
+python3 sync_from_chemask.py   # 同步 + 改写 + 扫描/动态对账/AST + pytest 门禁 + manifest
+python3 sync_from_chemask.py --verify   # commit 后执行：manifest vs git blob 对账
 ```
 
-脚本为 fail-closed 设计：任何同步源文件缺失、旧版本内容残留、测试失败，都会以非零码退出并中止发布；成功时生成 `build_manifest.json`（含各文件 SHA-256 与 git commit SHA），用于生产部署后逐字节对账。
+脚本为 fail-closed 设计：同步源缺失、旧内容残留（含 DESIGN 非修复章节的活旧命令）、基线对账不符（版本/测试数/工具集合）、测试失败、必需文件缺失，任一发生都以非零码退出并中止发布；成功时生成 `build_manifest.json`（10 个发布文件 SHA-256 + release_commit + 工作区状态）。**发布三步**：sync → commit → `--verify`（blob 对账）。
 
 ## 架构位置
 

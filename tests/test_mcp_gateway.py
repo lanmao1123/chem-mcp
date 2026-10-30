@@ -614,3 +614,42 @@ def test_trim_never_exceeds_hard_limit():
     assert len(text) <= 3000, f"超出硬限制: {len(text)}"
     assert p["student_id"] == 42
     assert "stale" in p["memory"]
+
+
+def test_first_creation_concurrent_no_overwrite(student):
+    """并发首建档：两个请求同时对无 Memory 行的学生 save_memory，
+    走原子建行+条件更新，两个 weak_topic 都必须保留（五轮评审：
+    ver=None 无版本路径在并发首写下互相覆盖）"""
+    import threading as _th
+    raws = []
+    for i in range(2):
+        raw = "ck_v17c_" + secrets.token_urlsafe(12)
+        db.issue_api_key(student, _token_hash(raw), label=f"v17c{i}")
+        raws.append(raw)
+    barrier = _th.Barrier(2)
+    errors = []
+
+    def worker(raw, topic):
+        try:
+            barrier.wait(timeout=10)
+            out = _tool("save_memory",
+                        {"weak_topic": topic, "session_id": "s", "digest": "d"}, raw)
+            if '"ok": true' not in out.lower():
+                errors.append(f"{topic}: {out[:200]}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{topic}: {e!r}")
+
+    t1 = _th.Thread(target=worker, args=(raws[0], "并发卡点甲"))
+    t2 = _th.Thread(target=worker, args=(raws[1], "并发卡点乙"))
+    t1.start(); t2.start(); t1.join(15); t2.join(15)
+    try:
+        assert not errors, f"并发首建档报错: {errors}"
+        mem = db.get_student_memory(student)
+        import json as _json
+        weak = _json.loads(mem["weak_topics"]) if mem and mem.get("weak_topics") else []
+        topics = {w["topic"] for w in weak}
+        assert {"并发卡点甲", "并发卡点乙"} <= topics, f"并发首写覆盖: {topics}"
+    finally:
+        for raw in raws:
+            db.revoke_api_key(_token_hash(raw))
+        db.clear_student_memory(student)
