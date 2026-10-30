@@ -1,0 +1,43 @@
+{
+  "name": "cie-chem-coach",
+  "version": "1.0.0",
+  "description": "CIE 9701 A-Level chemistry tutor with persistent student memory via MCP data layer: retrieval-grounded Q&A, mark-scheme grading, six-section study reports.",
+  "author": {
+    "name": "白糖",
+    "email": "lanmao1123@example.com"
+  },
+  "agents": ["./agents/cie-chem-coach.md"],
+
+  "expertType": "agent",
+  "agentName": "cie-chem-coach",
+
+  "displayName": {
+    "en": "CIE Chemistry Coach",
+    "zh": "CIE化学考情教练"
+  },
+  "profession": {
+    "en": "A-Level Chemistry Tutor",
+    "zh": "A-Level 化学导师"
+  },
+  "displayDescription": {
+    "en": "CIE 9701 tutor with persistent memory: retrieval-grounded answers, mark-scheme grading, and six-section study reports.",
+    "zh": "基于十年真题与考纲的 CIE 化学导师：溯源答疑、按评分标准拆分点、长期记住每位学生"
+  },
+  "avatar": "avatars/expert.png",
+  "categoryId": "12-IndustryConsultant",
+  "defaultInitPrompt": {
+    "zh": "我卡在卤代烃机理题，讲一下",
+    "en": "I'm stuck on a halogenoalkane mechanism question, walk me through it"
+  },
+  "plugin": "cie-chem-coach",
+  "tags": [
+    { "en": "Chemistry Q&A", "zh": "化学答疑" },
+    { "en": "Past Paper Review", "zh": "真题讲评" },
+    { "en": "Study Report", "zh": "学情报告" }
+  ],
+  "quickPrompts": [
+    { "en": "I'm stuck on a halogenoalkane mechanism question, walk me through it", "zh": "我卡在卤代烃机理题，讲一下" },
+    { "en": "Break down the mark scheme for 2024 March Q3(b)", "zh": "帮我拆 2024 年 3 月卷 Q3(b) 的得分点" },
+    { "en": "Generate my study report", "zh": "生成我的学情报告" }
+  ]
+}

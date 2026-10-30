@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 密钥与凭据（红线：任何真实 Token/密码不得入库）
+.env
+.env.*
+*.pem
+data/auth_secret
+
+# Token 明文备份（签发后请自行保存到密码管理器）
+tokens*.txt
+*.token
+
+# 运行产物
+*.log
+server.log
+.pytest_cache/
+
+# 系统文件
+.DS_Store
