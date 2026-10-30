@@ -63,7 +63,9 @@ DDL = [
         student_id INT NOT NULL,
         report_type ENUM('six_section', 'weekly', 'milestone') NOT NULL,
         content_md MEDIUMTEXT NOT NULL,
+        report_key VARCHAR(128) NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_reports_key (student_id, report_key),
         INDEX idx_reports_student_time (student_id, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS api_key_calls (
@@ -155,6 +157,17 @@ def run(apply: bool = False):
                 print("[ok] student_memory.version")
             else:
                 print("[check] would add student_memory.version")
+
+            # v1.4：reports.report_key（报告幂等写入）
+            if _column_exists(cur, "reports", "report_key"):
+                print("[skip] reports.report_key already exists")
+            elif apply:
+                cur.execute("ALTER TABLE reports ADD COLUMN report_key VARCHAR(128) NULL")
+                cur.execute("ALTER TABLE reports ADD UNIQUE KEY uq_reports_key"
+                            " (student_id, report_key)")
+                print("[ok] reports.report_key + UNIQUE(student_id,report_key)")
+            else:
+                print("[check] would add reports.report_key + unique key")
 
             if apply:
                 cur.execute(

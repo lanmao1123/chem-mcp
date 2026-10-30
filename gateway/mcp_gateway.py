@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -30,6 +31,12 @@ from fastapi.responses import JSONResponse
 from . import db
 
 log = logging.getLogger("mcp_gateway")
+
+_PROFILE_LIMIT = 3000          # get_profile 总返回量上限（字符）
+_REPORT_SUMMARY_CHARS = 200
+_STALE_DAYS = 7
+_MEMORY_RETRY = 3              # 乐观锁冲突重试次数（冲突概率极低，重读即解）
+TEACHER_ROLE = "teacher"
 
 # ---------------------------------------------------------------- 工具描述
 
@@ -121,7 +128,8 @@ TOOLS_SPEC: list[dict[str, Any]] = [
 _PROFILE_LIMIT = 3000          # get_profile 总返回量上限（字符）
 _REPORT_SUMMARY_CHARS = 200
 _STALE_DAYS = 7
-TEACHER_LABEL = "teacher"
+_MEMORY_RETRY = 3              # 乐观锁冲突重试次数（冲突概率极低，重读即解）
+TEACHER_ROLE = "teacher"
 
 
 # ---------------------------------------------------------------- 错误响应
@@ -163,8 +171,10 @@ def authenticate(request: Request) -> dict:
 
 
 def enforce_rate_limit(key_row: dict):
-    """业务动作限流（仅 tools/call 调用）。429 时附带 Retry-After 语义。"""
-    if db.rate_count_last_hour(key_row["id"]) >= key_row["rate_limit_h"]:
+    """业务动作限流（仅 tools/call 调用）。原子预计数语义：本次调用已插入计数，
+    所以判断是「计数 > 限额」——限额 N 表示窗口内允许恰好 N 次业务调用。
+    429 时附带 Retry-After 语义。"""
+    if db.rate_count_last_hour(key_row["id"]) > key_row["rate_limit_h"]:
         raise GatewayError("rate_limited", "业务调用超过每小时限额，请稍后再试", 429)
 
 
@@ -205,6 +215,47 @@ def _merge_weak_topics(current: list, new_topic: str | None,
 
 # ---------------------------------------------------------------- 工具实现
 
+def _trim_to_limit(payload: dict, limit: int = _PROFILE_LIMIT) -> str:
+    """结构化裁剪：按字段优先级收缩，直到序列化结果 ≤ limit。
+    教训：对 json.dumps 结果做字符串截断会产生非法 JSON（截断花括号/引号），
+    客户端 json.loads 直接炸——裁剪必须在"构建 payload"阶段做，而不是"序列化后"做。
+    优先级（保留→收缩）：身份 > stale > weak_topics > plan_stage > 对话 > 报告摘要 > summary > taught"""
+    def shrink(payload: dict, key_path: list, cap: int):
+        node = payload
+        for k in key_path[:-1]:
+            node = node[k]
+        leaf = key_path[-1]
+        v = node.get(leaf)
+        if v:
+            node[leaf] = v[:cap] if isinstance(v, str) else v[:cap]
+
+    # (字段路径, 逐轮裁剪到的长度)；None 值字段先清掉省空间
+    plan = [
+        (("memory", "taught_topics"), 20),
+        (("memory", "summary"), 800),
+        (("memory", "summary"), 400),
+        (("latest_report",), None),          # 整块丢弃
+        (("recent_dialogues",), None),       # 整块丢弃
+        (("memory", "summary"), 150),
+        (("memory", "taught_topics"), 8),
+        (("memory", "weak_topics"), 10),
+    ]
+    blob = json.dumps(payload, ensure_ascii=False)
+    for path, cap in plan:
+        if len(blob) <= limit:
+            break
+        if cap is None:
+            node = payload
+            for k in path[:-1]:
+                node = node.get(k, {}) if isinstance(node, dict) else {}
+            if isinstance(node, dict):
+                node[path[-1]] = None
+        else:
+            shrink(payload, path, cap)
+        blob = json.dumps(payload, ensure_ascii=False)
+    return blob  # 极端兜底：计划走完仍超限，也返回合法 JSON（只超长度，不破坏结构）
+
+
 def tool_get_profile(student_id: int) -> dict:
     mem = db.get_student_memory(student_id) or {}
     tries = db.recent_dialogues(student_id, limit=3)
@@ -238,11 +289,7 @@ def tool_get_profile(student_id: int) -> dict:
             "hint": "全文用 get_report 拉取",
         } if rpt else None),
     }
-    blob = json.dumps(payload, ensure_ascii=False)
-    if len(blob) > _PROFILE_LIMIT:  # 防御性截断：摘要字段优先保全
-        payload["memory"]["summary"] = (payload["memory"]["summary"] or "")[:1000]
-        blob = json.dumps(payload, ensure_ascii=False)
-    return {"content": [{"type": "text", "text": blob[:_PROFILE_LIMIT]}]}
+    return {"content": [{"type": "text", "text": _trim_to_limit(payload)}]}
 
 
 def _to_epoch(v) -> float:
@@ -254,22 +301,50 @@ def _to_epoch(v) -> float:
     return 0.0
 
 
+def _retry_on_conflict(fn):
+    """乐观锁重试装饰器：MemoryConflict 时重读重写（最多 _MEMORY_RETRY 次）。
+    教训：read-merge-write 在并发下会 Lost Update——A 读 weak=[A]，B 读 weak=[A]，
+    A 写 [A,B]，B 写 [A,C]，B 覆盖掉 A。靠 version 条件更新 + 重试保证收敛。"""
+    @functools.wraps(fn)
+    def wrapper(student_id: int, *a, **kw):
+        last_exc = None
+        for _ in range(_MEMORY_RETRY):
+            try:
+                return fn(student_id, *a, **kw)
+            except db.MemoryConflict as e:
+                last_exc = e
+                time.sleep(0.05)  # 50ms 退避，冲突概率极低，重读即解
+        raise GatewayError("conflict", "档案并发更新冲突，请重试", 409) from last_exc
+    return wrapper
+
+
+@_retry_on_conflict
+def _update_profile_locked(student_id: int, fields: dict, weak_add: list[str] | None):
+    ver = db.get_memory_version(student_id)
+    if ver is not None:
+        if weak_add:
+            weak = _load_json((db.get_student_memory(student_id) or {}).get("weak_topics"))
+            for t in weak_add:
+                weak = _merge_weak_topics(weak, t, None)
+            fields = {**fields, "weak_topics": weak}
+        db.upsert_student_memory(student_id, expected_version=ver, **fields)
+    else:
+        db.upsert_student_memory(student_id, **fields)
+
+
 def tool_update_profile(student_id: int, args: dict) -> dict:
     fields = {k: args[k] for k in
               ("exam_board", "target_grade", "current_score", "summary", "preferences")
               if k in args}
-    weak = _load_json((db.get_student_memory(student_id) or {}).get("weak_topics"))
-    for t in args.get("weak_topics") or []:
-        weak = _merge_weak_topics(weak, t, None)
-    if args.get("weak_topics") is not None:
-        fields["weak_topics"] = weak
-    db.upsert_student_memory(student_id, **fields)
+    _update_profile_locked(student_id, fields, args.get("weak_topics"))
     return {"content": [{"type": "text", "text": json.dumps(
         {"ok": True, "student_id": student_id}, ensure_ascii=False)}]}
 
 
-def tool_save_memory(student_id: int, args: dict) -> dict:
+@_retry_on_conflict
+def _save_memory_locked(student_id: int, args: dict) -> dict:
     mem = db.get_student_memory(student_id) or {}
+    ver = db.get_memory_version(student_id)
     weak = _load_json(mem.get("weak_topics"))
     taught = _load_json(mem.get("taught_topics"))
     patch: dict = {}
@@ -291,39 +366,53 @@ def tool_save_memory(student_id: int, args: dict) -> dict:
         merged = (base + "\n" + args["summary_patch"].strip()).strip()
         patch["summary"] = merged[-2000:]  # 超限保留尾部（近因优先）
     if patch:
-        db.upsert_student_memory(student_id, **patch)
+        if ver is not None:
+            db.upsert_student_memory(student_id, expected_version=ver, **patch)
+        else:
+            db.upsert_student_memory(student_id, **patch)
     if args.get("session_id") and args.get("digest"):
         db.add_dialogue(student_id, args["session_id"], "student", args["digest"])
-    return {"content": [{"type": "text", "text": json.dumps(
-        {"ok": True, "merged_fields": list(patch.keys())}, ensure_ascii=False)}]}
+    return {"ok": True, "merged_fields": list(patch.keys())}
+
+
+def tool_save_memory(student_id: int, args: dict) -> dict:
+    result = _save_memory_locked(student_id, args)
+    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
 
 
 def tool_record_attempt(student_id: int, args: dict) -> dict:
     idem = args.get("idem_key") or ""
     qid = args["qid"]
-    if idem:
-        dup = db.find_attempt_by_idem(student_id, qid, idem)
-        if dup:
-            return {"content": [{"type": "text", "text": json.dumps(
-                {"ok": True, "duplicate": True, "attempt_id": dup}, ensure_ascii=False)}]}
     weak_points = args.get("weak_points") or []
     if args.get("time_spent_s"):
         weak_points = list(weak_points) + [f"time:{args['time_spent_s']}s"]
-    # 幂等落库：idem_key 编码进 weak_points 元信息（schema 不动，语义扩展）
     if idem:
-        weak_points = list(weak_points) + [f"idem:{idem}"]
-    attempt_id = db.add_attempt(
-        student_id, qid, paper=args.get("paper"),
-        question_no=args.get("question_no"), score=args.get("score"),
-        marks_total=args.get("marks_total"),
-        error_types=args.get("error_types"), weak_points=weak_points,
-        topic_detail=args.get("topic_detail"), source="mcp")
+        # 原子幂等：UNIQUE(student_id,qid,idem_key) 由数据库保证，
+        # 并发重试捕获 1062 冲突回读——check→insert 两步在并发下有竞态窗口
+        attempt_id, duplicate = db.add_attempt_idempotent(
+            student_id, idem, qid,
+            paper=args.get("paper"), question_no=args.get("question_no"),
+            score=args.get("score"), marks_total=args.get("marks_total"),
+            error_types=args.get("error_types"), weak_points=weak_points,
+            topic_detail=args.get("topic_detail"), source="mcp")
+        if duplicate:
+            return {"content": [{"type": "text", "text": json.dumps(
+                {"ok": True, "duplicate": True, "attempt_id": attempt_id},
+                ensure_ascii=False)}]}
+    else:
+        attempt_id = db.add_attempt(
+            student_id, qid, paper=args.get("paper"),
+            question_no=args.get("question_no"), score=args.get("score"),
+            marks_total=args.get("marks_total"),
+            error_types=args.get("error_types"), weak_points=weak_points,
+            topic_detail=args.get("topic_detail"), source="mcp")
     # 连续两次同 qid 满分 → weak_topics 标记 solved（§8.5 规则）
     _auto_solve_on_repeat_success(student_id, qid)
     return {"content": [{"type": "text", "text": json.dumps(
         {"ok": True, "attempt_id": attempt_id, "duplicate": False}, ensure_ascii=False)}]}
 
 
+@_retry_on_conflict
 def _auto_solve_on_repeat_success(student_id: int, qid: str):
     rows = db.attempts_of(student_id)
     same = [r for r in rows if r["qid"] == qid and r["score"] is not None
@@ -335,10 +424,15 @@ def _auto_solve_on_repeat_success(student_id: int, qid: str):
     if not topic:
         return
     mem = db.get_student_memory(student_id) or {}
+    ver = db.get_memory_version(student_id)
     weak = _load_json(mem.get("weak_topics"))
     merged = _merge_weak_topics(weak, None, topic)
     if merged != weak:
-        db.upsert_student_memory(student_id, weak_topics=merged)
+        if ver is not None:
+            db.upsert_student_memory(student_id, expected_version=ver,
+                                     weak_topics=merged)
+        else:
+            db.upsert_student_memory(student_id, weak_topics=merged)
 
 
 def tool_list_mistakes(student_id: int, args: dict) -> dict:
@@ -361,8 +455,9 @@ def tool_get_mastery(student_id: int) -> dict:
 
 
 def tool_class_summary(key_row: dict) -> dict:
-    label = (key_row.get("label") or "")
-    if TEACHER_LABEL not in label.lower():
+    # 正式 RBAC：api_keys.role 列（student/teacher）——
+    # 教训："label 包含 teacher" 是字符串约定，不是权限模型
+    if (key_row.get("role") or "student") != TEACHER_ROLE:
         raise GatewayError("forbidden", "class_summary 仅教师 Token 可用", 403)
     rows = db.class_mastery()
     return {"content": [{"type": "text", "text": json.dumps(
@@ -373,25 +468,57 @@ def tool_class_summary(key_row: dict) -> dict:
 
 app = FastAPI(title="chemask MCP gateway", docs_url=None, redoc_url=None)
 
-# get_report 是第 8 个辅助工具（方案定稿 7 个；get_report 属 get_profile 全文按需拉取通道）
+# get_report / save_report：报告读写通道（方案定稿 7 个核心工具 + 2 个报告辅助工具）
 TOOLS_SPEC.append({
     "name": "get_report",
     "description": "按需拉取最近一份学情报告全文（Markdown）。",
     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
 })
+TOOLS_SPEC.append({
+    "name": "save_report",
+    "description": ("持久化学情报告到数据库（学情报告闭环的写入口）。"
+                    "report_key 为幂等键：建议 会话ID+日期+序号，由调用端生成并保持稳定——"
+                    "同一 report_key 重复提交只落一份（Agent 重试安全）。"
+                    "必须等本工具返回成功后，才能向学生宣称\"报告已存档\"。"),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "report_type": {"type": "string",
+                            "enum": ["six_section", "weekly", "milestone"],
+                            "description": "报告类型：六段式/周报/里程碑"},
+            "content_md": {"type": "string", "description": "报告全文（Markdown）"},
+            "report_key": {"type": "string",
+                           "description": "幂等键：session_id+日期+序号，调用端生成"},
+        },
+        "required": ["report_type", "content_md", "report_key"],
+        "additionalProperties": False,
+    },
+})
 
 
 def tool_get_report(student_id: int) -> dict:
-    mem = db.get_student_memory  # noqa: F841  (占位避免误删)
-    with db.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT report_type, content_md, created_at FROM reports"
-                " WHERE student_id=%s ORDER BY id DESC LIMIT 1", (student_id,))
-            r = cur.fetchone()
+    r = db.latest_report_full(student_id)
     if not r:
         return {"content": [{"type": "text", "text": "暂无报告"}]}
     return {"content": [{"type": "text", "text": r["content_md"]}]}
+
+
+def tool_save_report(student_id: int, args: dict) -> dict:
+    if not all(k in args for k in ("report_type", "content_md", "report_key")):
+        raise GatewayError("bad_request",
+                           "缺少必填字段：report_type / content_md / report_key", 400)
+    rtype = args["report_type"]
+    content = args["content_md"]
+    key = args["report_key"].strip()
+    if not (1 <= len(key) <= 128):
+        raise GatewayError("bad_request", "report_key 长度需在 1-128 字符", 400)
+    if len(content) > 60000:  # MEDIUMTEXT 上限内设业务上限，防上下文滥用
+        raise GatewayError("bad_request", "报告超过 60000 字符上限", 400)
+    report_id, duplicate = db.add_report_idempotent(
+        student_id, rtype, content, key)
+    return {"content": [{"type": "text", "text": json.dumps(
+        {"ok": True, "report_id": report_id, "duplicate": duplicate},
+        ensure_ascii=False)}]}
 
 
 _TOOL_IMPL = {
@@ -403,6 +530,7 @@ _TOOL_IMPL = {
     "get_mastery": lambda sid, args, key: tool_get_mastery(sid),
     "class_summary": lambda sid, args, key: tool_class_summary(key),
     "get_report": lambda sid, args, key: tool_get_report(sid),
+    "save_report": lambda sid, args, key: tool_save_report(sid, args),
 }
 
 

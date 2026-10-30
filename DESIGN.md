@@ -1,6 +1,6 @@
 # chem-mcp 技术方案与设计背景
 
-> 版本：v1.3 ｜ 更新：2026-10-30 ｜ 状态：生产运行中（单实例试点规模）
+> 版本：v1.4 ｜ 更新：2026-10-30（二轮外部评审修复） ｜ 状态：生产运行中（单实例试点规模）
 > 本文档面向审查者：完整交代项目背景、要解决的问题、每个关键设计决策的动机、已知取舍与未解决问题。配套代码全部在本仓库内。
 
 ---
@@ -214,8 +214,44 @@ MySQL              = 状态层：唯一真相
 | 5 | class_summary 全量加载学生列表计算 | 试点 <50 人 | 分页/物化视图（按需） |
 | 6 | 教师Token与学生Token同表，scope 粒度=role 二值 | 满足当前 | 引入 scopes 列（student:read / class:read） |
 | 7 | 无请求链路 tracing id | 日志有 key_id+工具名 | 加 X-Request-Id 透传 |
+| 8 | 重名学生经 create_student 可能共享 student_id（INSERT IGNORE 按名幂等） | 试点期人工对名单兜底 | **P1**：签发流程改 user_id 映射，姓名仅展示 |
+| 9 | 测试依赖真实 MySQL，无 CI | 33 用例本地跑 | **P1**：单测/集成分离 + GitHub Actions |
+| 10 | dialogue_log 写入无独立幂等键 | 低危（摘要重复无资损） | **P1**：统一 operation_id 幂等框架 |
+| 11 | class_summary 无班级边界（teacher 见全表） | 试点期教师=管理员 | **P1**：teacher_classes 关联 + 查询强制带边界 |
 
-## 5. 外部评审修复记录（2026-10-30）
+## 5. 二轮评审修复记录（v1.4，2026-10-30）
+
+第二轮外部审查（ChatGPT 对 GitHub main 分支静态审查）发现了一个**比代码 bug 更严重的问题**：
+
+> **v1.3 的文档声称修复的四项内容，GitHub 仓库里的 `gateway/mcp_gateway.py` 和 `tests/` 仍是旧版**——db.py 是新的，网关没接入。
+
+**根因（我们的流程失误）**：仓库创建于 v1.3 编码之前（cp 快照），修复在 chemask 工作区完成并部署生产，但推送仓库时只重新 cp 了部分文件。教训：**发布仓库必须以"内容 diff 为零"验证，不能以"曾经复制过"记忆为准**。已修复并在本仓库根加入同步脚本前的对账检查。
+
+### v1.4 修复清单
+
+| # | 指控 | 核实 | 处置 |
+|---|---|---|---|
+| 1 | v1.3 四项修复未接入仓库网关/测试 | ✅ **属实（同步事故）** | 仓库全量同步至生产版本（`gateway/mcp_gateway.py`、`tests/` 逐字节一致），33/33 测试在仓库 import 路径下通过 |
+| 2 | 缺 `save_report`：报告生成后无处持久化，数据闭环断裂 | ✅ 属实 | **新增第 9 个工具**：`save_report(report_type, content_md, report_key)`，`UNIQUE(student_id, report_key)` 原子幂等（Agent 重试只落一份）；专家提示词同步规则"**必须等 save_report 返回成功才能宣称已存档**" |
+| 3 | 限流计数 SELECT→INSERT 非原子，并发可穿越配额 | ✅ 属实 | **已修**：改为 insert-before-count（先原子占位再统计），边界语义同步修正为"计数 > 限额"（限额 N = 窗口内恰好 N 次放行），429 路径天然计数 |
+| 4 | Expert Prompt 与工具 schema 不一致（save_memory 无 target_grade 参数；报告存档话术提前） | ✅ 属实 | **已修**：提示词明确"目标等级/分数段/卷型变化走 update_profile"；报告存档流程改为"save_report 成功后才宣称" |
+| 5 | 重名学生 create_student INSERT IGNORE 返回同一 student_id → 数据串号 | ✅ 属实（schema 已有 user_id 列但签发流程未用） | **列入 P1**（需要业务层注册流程配合，见路线图 #8）；当前试点用"报名字+教师对名单"人工兜底 |
+| 6 | class_summary 无班级权限边界，teacher 可看全表 | ✅ 属实（设计如此） | **列入 P1**（路线图 #6：teacher_classes 关联表）；试点期教师=管理员，文档已声明 |
+| 7 | 测试依赖真实 MySQL / 缺 CI | ✅ 属实 | **列入 P1**（路线图 #9）；当前 33 用例跑真实库（本地隧道），单测/集成分离与 GitHub Actions 待加 |
+| 8 | 对话摘要无独立幂等键 | ✅ 属实（低危） | **列入 P1**（统一 operation_id 方案，见路线图 #10） |
+
+### v1.4 后的工具全景（9 个）
+
+```
+读：get_profile / list_mistakes / get_mastery / get_report / class_summary(teacher)
+写：update_profile / save_memory / record_attempt(幂等) / save_report(幂等·新)
+```
+
+学情报告闭环就此完整：**生成（LLM）→ save_report 落库（幂等）→ get_profile 带出摘要 → get_report 按需全文**。
+
+---
+
+## 6. 一轮评审修复记录（v1.3，2026-10-30）
 
 收到一份高质量外部评审（判 6/10 生产级），逐条核实后修复情况：
 
@@ -231,7 +267,7 @@ MySQL              = 状态层：唯一真相
 | 应基于官方 MCP SDK / 协议偏旧 | ⚠️ 有意识取舍 | **已声明**（§3.8）：兼容具体生产客户端优先，迁移路径已预留，文档不再宣称"标准实现" |
 | 限流应 Redis 分布式 | ⚠️ 属实但超前 | **列入路线图** #1（当前单实例） |
 
-## 6. 快速开始
+## 7. 快速开始
 
 ```bash
 # 1. 配置 .env（MySQL 连接；本地开发走 SSH 隧道 3307）
@@ -258,7 +294,7 @@ pytest tests/test_mcp_gateway.py -q
 
 生产部署：systemd 服务（`127.0.0.1:8721`，仅本机监听）+ nginx HTTPS 反代（`/chem-mcp/`）。MySQL 永不暴露公网。
 
-## 7. 目录说明
+## 8. 目录说明
 
 ```
 chem-mcp/

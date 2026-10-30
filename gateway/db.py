@@ -154,7 +154,9 @@ SCHEMA = [
         student_id INT NOT NULL,
         report_type ENUM('six_section', 'weekly', 'milestone') NOT NULL,
         content_md MEDIUMTEXT NOT NULL,
+        report_key VARCHAR(128) NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_reports_key (student_id, report_key),
         INDEX idx_reports_student_time (student_id, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS api_key_calls (
@@ -442,6 +444,20 @@ def _migrate_mcp_v1_3(cur):
     if not cur.fetchone()["n"]:
         cur.execute("ALTER TABLE student_memory ADD COLUMN version INT"
                     " NOT NULL DEFAULT 1")
+    # 4) v1.4：reports.report_key（报告幂等写入，Agent 重试只落一份）
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.COLUMNS"
+        " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='reports'"
+        " AND COLUMN_NAME='report_key'")
+    if not cur.fetchone()["n"]:
+        cur.execute("ALTER TABLE reports ADD COLUMN report_key VARCHAR(128) NULL")
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.STATISTICS"
+        " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='reports'"
+        " AND INDEX_NAME='uq_reports_key'")
+    if not cur.fetchone()["n"]:
+        cur.execute("ALTER TABLE reports ADD UNIQUE KEY uq_reports_key"
+                    " (student_id, report_key)")
 
 
 init_db()
@@ -644,16 +660,18 @@ def touch_api_key(key_id: int):
 
 
 def rate_count_last_hour(key_id: int) -> int:
-    """网关调用日志近 1 小时计数（mcp_call_log 复用 dialogue_log 表结构不适合，用独立轻量表）"""
+    """网关业务调用计数（原子版）：先插入本次调用，再统计窗口内总数——
+    单条 INSERT 原子占位，并发请求不会同时读到相同旧计数（v1.2 是 SELECT 后
+    INSERT 两步，并发下配额可被多请求同时通过）。
+    返回包含本次调用的窗口计数，达到限额时调用方拒绝（本次已计数，无需补插）。"""
     with get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("INSERT INTO api_key_calls(key_id) VALUES (%s)", (key_id,))
             cur.execute(
                 "SELECT COUNT(*) AS n FROM api_key_calls"
                 " WHERE key_id=%s AND called_at > NOW() - INTERVAL 1 HOUR",
                 (key_id,))
-            n = cur.fetchone()["n"]
-            cur.execute("INSERT INTO api_key_calls(key_id) VALUES (%s)", (key_id,))
-            return n
+            return cur.fetchone()["n"]
 
 
 def issue_api_key(student_id: int, token_hash: str, label: str | None = None,
@@ -772,13 +790,38 @@ def recent_dialogues(student_id: int, limit: int = 3):
             return cur.fetchall()
 
 
-def add_report(student_id: int, report_type: str, content_md: str):
+def add_report(student_id: int, report_type: str, content_md: str,
+               report_key: str | None = None) -> int:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO reports(student_id, report_type, content_md)"
                 " VALUES (%s,%s,%s)", (student_id, report_type, content_md))
             return cur.lastrowid
+
+
+def add_report_idempotent(student_id: int, report_type: str, content_md: str,
+                          report_key: str) -> tuple[int, bool]:
+    """原子幂等报告写入：UNIQUE(student_id, report_key) 保证 Agent 重试只落一份。
+    与 add_attempt_idempotent 同模式：唯一约束 + 1062 冲突回读。
+    report_key 应由调用端工作流生成（session_id+日期+序号），不要依赖 LLM 每次新生成。"""
+    assert report_key, "report_key required"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "INSERT INTO reports(student_id, report_type, content_md, report_key)"
+                    " VALUES (%s,%s,%s,%s)",
+                    (student_id, report_type, content_md, report_key))
+                return cur.lastrowid, False
+            except pymysql.err.IntegrityError as e:
+                if e.args[0] != 1062:
+                    raise
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM reports WHERE student_id=%s AND report_key=%s",
+                    (student_id, report_key))
+                return cur.fetchone()["id"], True
 
 
 def latest_report_meta(student_id: int, summary_chars: int = 200):
