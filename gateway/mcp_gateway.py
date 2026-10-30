@@ -1,4 +1,4 @@
-"""MCP 网关：把学生数据层暴露为 9 个白名单 MCP 工具（v1.2 方案 §8.4，v1.5 评审加固）。
+"""MCP 网关：把学生数据层暴露为 9 个白名单 MCP 工具（v1.2 方案 §8.4，v1.8 评审加固）。
 
 9 工具 = 7 核心（get_profile/update_profile/save_memory/record_attempt/
 list_mistakes/get_mastery/class_summary）+ 2 报告通道（get_report/save_report）。

@@ -1,0 +1,14 @@
+# chem-mcp 发布所需的最小依赖集（网关 + 数据层 + 测试）
+# 用途：CI 安装、生产部署复现、审查者本地跑测试。
+# 注意：这是主应用 chemask 依赖的子集，不含其业务模块依赖（PyMuPDF/openai/qiniu 等）。
+# 版本固定为本地已通过 78 例测试的实测版本，避免 CI 与生产漂移。
+
+fastapi==0.141.1
+uvicorn==0.52.4
+PyMySQL==1.2.3
+DBUtils==3.2.0
+python-dotenv==1.2.3
+
+# 测试依赖
+pytest==9.1.1
+httpx==0.28.1        # fastapi.testclient 需要

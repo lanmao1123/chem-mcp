@@ -617,39 +617,60 @@ def test_trim_never_exceeds_hard_limit():
 
 
 def test_first_creation_concurrent_no_overwrite(student):
-    """并发首建档：两个请求同时对无 Memory 行的学生 save_memory，
-    走原子建行+条件更新，两个 weak_topic 都必须保留（五轮评审：
-    ver=None 无版本路径在并发首写下互相覆盖）"""
-    import threading as _th
+    """并发首建档确定性测试（六轮评审升级）。
+
+    五轮版用请求入口 Barrier，不能保证两线程都读到空 Memory。
+    本版 monkeypatch db.get_student_memory：
+    - 每个线程第一次读取强制返回 None（不管 DB 真实状态），并过 Barrier 同步；
+    - 重试时（thread-local 标志）不再等待 Barrier，读取真实数据；
+    - 两线程都以 version=1 进入原子建行+条件更新，乐观锁仲裁，败者重试合并。
+    断言：双卡点保留、version 递增、无超时、无脏数据。"""
+    import threading as _th, json as _json
+
+    db.clear_student_memory(student)   # 保证是真正的"首次建档"起点（无 Memory 行）
+
     raws = []
     for i in range(2):
-        raw = "ck_v17c_" + secrets.token_urlsafe(12)
-        db.issue_api_key(student, _token_hash(raw), label=f"v17c{i}")
+        raw = "ck_v18c_" + secrets.token_urlsafe(12)
+        db.issue_api_key(student, _token_hash(raw), label=f"v18c{i}")
         raws.append(raw)
+
     barrier = _th.Barrier(2)
+    tls = _th.local()
     errors = []
+    orig_get = db.get_student_memory
 
-    def worker(raw, topic):
-        try:
+    def sync_get_memory(sid):
+        if not getattr(tls, "first_done", False):
+            tls.first_done = True
             barrier.wait(timeout=10)
-            out = _tool("save_memory",
-                        {"weak_topic": topic, "session_id": "s", "digest": "d"}, raw)
-            if '"ok": true' not in out.lower():
-                errors.append(f"{topic}: {out[:200]}")
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"{topic}: {e!r}")
+            return None  # 强制首次读取为空——确定性构造竞态窗口
+        return orig_get(sid)  # 重试读取真实数据
 
-    t1 = _th.Thread(target=worker, args=(raws[0], "并发卡点甲"))
-    t2 = _th.Thread(target=worker, args=(raws[1], "并发卡点乙"))
-    t1.start(); t2.start(); t1.join(15); t2.join(15)
+    db.get_student_memory = sync_get_memory
     try:
+        def worker(raw, topic):
+            try:
+                out = _tool("save_memory",
+                            {"weak_topic": topic, "session_id": "s", "digest": "d"}, raw)
+                if '"ok": true' not in out.lower():
+                    errors.append(f"{topic}: {out[:200]}")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{topic}: {e!r}")
+
+        t1 = _th.Thread(target=worker, args=(raws[0], "并发卡点甲"))
+        t2 = _th.Thread(target=worker, args=(raws[1], "并发卡点乙"))
+        t1.start(); t2.start(); t1.join(15); t2.join(15)
+
         assert not errors, f"并发首建档报错: {errors}"
-        mem = db.get_student_memory(student)
-        import json as _json
+        # 用 orig_get 读真实数据（不受 monkeypatch 影响）
+        mem = orig_get(student)
         weak = _json.loads(mem["weak_topics"]) if mem and mem.get("weak_topics") else []
         topics = {w["topic"] for w in weak}
         assert {"并发卡点甲", "并发卡点乙"} <= topics, f"并发首写覆盖: {topics}"
+        assert mem["version"] >= 2, f"version 应≥2（两线程各递增一次）: {mem.get('version')}"
     finally:
+        db.get_student_memory = orig_get
         for raw in raws:
             db.revoke_api_key(_token_hash(raw))
         db.clear_student_memory(student)

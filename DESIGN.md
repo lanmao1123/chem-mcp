@@ -1,6 +1,6 @@
 # chem-mcp 技术方案与设计背景
 
-> 版本：v1.7 ｜ 更新：2026-10-30（五轮评审修复：首建档并发原子化/章节级扫描豁免/动态对账/manifest 固定清单与 --verify blob 对账） ｜ 状态：生产运行中（单实例试点规模）
+> 版本：v1.8 ｜ 更新：2026-10-30（六轮评审修复：豁免精确标题匹配/动态对账精确化/AST 动态导入/manifest 严格化/首建档确定性并发/发布门禁回归测试/生产对账工具） ｜ 状态：生产运行中（单实例试点规模）
 > 本文档面向审查者：完整交代项目背景、要解决的问题、每个关键设计决策的动机、已知取舍与未解决问题。配套代码全部在本仓库内。
 
 ---
@@ -188,7 +188,7 @@ WHERE student_id=%s AND version=%s    -- rowcount==0 → 冲突
    - `notifications/initialized`（无 id 通知）必须返回 202 空体（返回 400 会让客户端中断握手陷入重连循环）；
    - 短流 SSE 会触发 3 秒重连风暴，需长流 + 心跳。
    官方 SDK 对这些边缘行为（尤其非标准客户端的容错）是黑盒；手写层让我们在 10 分钟内定位并修复每一次故障，修复版本当天上线。
-2. **协议面极小**。本网关只需 `initialize` / `tools/list` / `tools/call` / notifications 四个方法，无 resources/prompts/sampling 等能力。手写面 ≈ 60 行路由代码，且有 37 个测试用例锁定行为。
+2. **协议面极小**。本网关只需 `initialize` / `tools/list` / `tools/call` / notifications 四个方法，无 resources/prompts/sampling 等能力。手写面 ≈ 60 行路由代码，且有 82 个测试用例锁定行为（含发布门禁回归测试）。
 3. **迁移路径已预留**。`_TOOL_IMPL` 字典是唯一的工具注册点，协议层与工具层完全解耦——若后续需要官方 SDK（例如要兼容更多 MCP 宿主），只需替换路由层，9 个工具实现零改动。
 
 **诚实的定位声明**：本项目是 *MCP-compatible data gateway for a specific production client*，不是 *reference MCP server implementation*。若你的目标是后者，请以官方 SDK 为准——这也是我们 README 不宣称"标准 MCP 实现"的原因。
@@ -215,7 +215,7 @@ MySQL              = 状态层：唯一真相
 | 6 | 教师Token与学生Token同表，scope 粒度=role 二值 | 满足当前 | 引入 scopes 列（student:read / class:read） |
 | 7 | 无请求链路 tracing id | 日志有 key_id+工具名 | 加 X-Request-Id 透传 |
 | 8 | 重名学生经 create_student 可能共享 student_id（INSERT IGNORE 按名幂等） | 试点期人工对名单兜底 | **P1**：签发流程改 user_id 映射，姓名仅展示 |
-| 9 | 测试依赖真实 MySQL，无 CI | 37 用例本地跑 | **P1**：单测/集成分离 + GitHub Actions |
+| 9 | 测试依赖真实 MySQL；CI 未强制 | v1.8 已加 `.github/workflows/release-gate.yml`（语法/AST/动态对账/`--verify` + MySQL 8 service container 集成测试，隔离库不吃生产凭据）；82 用例本地与 CI 双跑 | **P1 剩余**：branch protection / required status check 属仓库设置，须管理员手工开启（代码无法自我强制）；开启前"直接 cp + commit 绕过脚本"仍不可被仓库侧阻止 |
 | 10 | dialogue_log 写入无独立幂等键 | 低危（摘要重复无资损） | **P1**：统一 operation_id 幂等框架 |
 | 11 | class_summary 无班级边界（teacher 见全表） | 试点期教师=管理员 | **P1**：teacher_classes 关联 + 查询强制带边界 |
 | 12 | ~~Memory 首建档（ver=None）并发首写无版本保护~~ | **v1.7 已修复**：无行按 version=1 统一走原子建行+条件更新，见 §5t.3 | 关闭（并发测试锁定） |
@@ -238,7 +238,7 @@ MySQL              = 状态层：唯一真相
 | 4 | Expert Prompt 与工具 schema 不一致（save_memory 无 target_grade 参数；报告存档话术提前） | ✅ 属实 | **已修**：提示词明确"目标等级/分数段/卷型变化走 update_profile"；报告存档流程改为"save_report 成功后才宣称" |
 | 5 | 重名学生 create_student INSERT IGNORE 返回同一 student_id → 数据串号 | ✅ 属实（schema 已有 user_id 列但签发流程未用） | **列入 P1**（需要业务层注册流程配合，见路线图 #8）；当前试点用"报名字+教师对名单"人工兜底 |
 | 6 | class_summary 无班级权限边界，teacher 可看全表 | ✅ 属实（设计如此） | **列入 P1**（路线图 #6：teacher_classes 关联表）；试点期教师=管理员，文档已声明 |
-| 7 | 测试依赖真实 MySQL / 缺 CI | ✅ 属实 | **列入 P1**（路线图 #9）；当前 37 用例跑真实库（本地隧道），单测/集成分离与 GitHub Actions 待加 |
+| 7 | 测试依赖真实 MySQL / 缺 CI | ✅ 属实 | **列入 P1**（路线图 #9）；v1.5–v1.6 时期 37 用例跑真实库（本地隧道），单测/集成分离与 GitHub Actions 待加（截至 v1.8 为 82 例，含发布门禁回归测试） |
 | 8 | 对话摘要无独立幂等键 | ✅ 属实（低危） | **列入 P1**（统一 operation_id 方案，见路线图 #10） |
 
 ### v1.4 后的工具全景（9 个）
@@ -294,7 +294,7 @@ COMMIT;                                     -- 释放锁，后续请求可见已
 
 三轮时修正了评审指定的 7 处位置（README"8 个白名单工具"→9、"30 个测试"→37、DESIGN §2/§3.8/§8 三处 30→37、网关模块 docstring"7 个工具/app.db"→"9 个工具/db.py"），§5 限流行表述已更正为诚实版本（不再声称 v1.4 已完成原子限流）。**但四轮复查证明"指定位置修正"不等于"全仓库一致"**——README 徽章、README 目录注释、DESIGN 路线图等未列入清单的位置仍残留 33/v1.4/旧启动命令。教训已固化为机制：文档对账不靠人工清单，靠 `sync_from_chemask.py` 的全量模式扫描（见 §5ter），扫描规则与版本号同步演进。
 
-**关于"生产-仓库逐字节一致"的验证方式**：评审正确指出其无法独立验证。我们的对账方式是 `diff` 本地两份文件 + 在仓库布局下跑完整测试套件（本版 37/37 于 chem-mcp/ 目录通过）。CI 落地前，这是人工流程；路线图 #9 的 GitHub Actions 即为此而设。
+**关于"生产-仓库逐字节一致"的验证方式**：评审正确指出其无法独立验证。我们的对账方式是 `diff` 本地两份文件 + 在仓库布局下跑完整测试套件（v1.5 时 37/37 于 chem-mcp/ 目录通过；当前基线 82 用例）。CI 落地前，这是人工流程；路线图 #9 的 GitHub Actions 即为此而设。
 
 ---
 
@@ -386,6 +386,71 @@ db 层 `expected_version` 路径本身已是原子的：`INSERT IGNORE INTO stud
 
 ---
 
+## 5quin. 六轮评审修复记录（v1.8，2026-10-30）
+
+第六轮审查结论"有条件放行"，并要求本轮一次性修完发布门禁与并发边界。本轮改动量最大的是**把门禁自身变成被测对象**（新增 `tests/test_release_gate.py`，44 例）。逐项如下：
+
+### 5qn.1 扫描豁免：章节编号前缀 → H2 标题精确匹配
+
+**残留漏洞（评审构造成立）**：v1.7 用 `line.startswith("## 5.")` 之类判断章节，因此攻击者在快速开始里写一个 `## 5. 快速开始（伪装的历史章节）` 即可获得豁免，随后放入活旧命令。
+
+**修复**：`get_design_exempt_lines(text) -> set[int]` 变为**不依赖文件系统的纯函数**，H2 标题必须**完整等于** `DESIGN_HISTORY_SECTIONS` 白名单中的某一项（6 条：§5/§5bis/§5ter/§5quater/§5quin/§6，含标题全文与日期）；只豁免标题之后、下一个 H2 之前的内容；H3/H4 不终止章节；标题被改写或伪造则默认不豁免。攻击样例 A–E（快速开始 blockquote / 快速开始表格 / 伪造 `## 5. 快速开始` / 历史章节内引用 / 历史章节结束后再出现）全部自动化在 `test_release_gate.py` 中断言。
+
+### 5qn.2 动态对账：从"存在性"改为"计数 + 精确相等"
+
+| 评审问题 | v1.7 | v1.8 |
+|---|---|---|
+| 正确徽章存在时再加一个旧徽章可通过 | 只判断正确串存在 | **count 必须恰好 1**，且值严格等于 `tests-{N}%2F{N}` / `version-{V}`；多一个旧徽章即 FAIL |
+| DESIGN 版本行 | 匹配到即过 | **恰好一条** `> 版本：v{V} ` 元信息行，出现第二条冲突行即 FAIL |
+| 测试数量靠文档声明 | 正则统计 `^def test_` 单文件 | **AST 统计 `tests/` 下全部 `test_` 函数**（跨文件），并与 pytest 实际通过数双向一致 |
+| 工具清单段内夹带第 10 个工具 | 每段只取首个标识符 | 按 `/` 分段，每段须匹配 `^[a-z_]+(（...）)?$` 单工具格式，**集合 + 顺序**与 `CURRENT_TOOLS` 严格相等 |
+| README 说 9 个、代码实际不同 | 未检查 | **AST 提取 Gateway 实际注册工具**（`TOOLS_SPEC` 字面量 + `.append()` 追加 + `_TOOL_IMPL` 键）与基线比对 |
+| 活跃文档仍写旧测试数 | 未扫描 | 动态正则（`N 个测试用例` / `N 用例本地跑` / `N 用例：`）匹配到 **≠ 基线** 即 FAIL，仅历史章节豁免 |
+
+### 5qn.3 AST import 扫描：补动态导入
+
+v1.7 只覆盖 `import app.x` / `from app.x import` / 函数内延迟导入。v1.8 增加：`importlib.import_module("app.x")`、`__import__("app.x")`、`import importlib as il` 别名调用、`from importlib import import_module` 后的别名调用；**参数非静态字符串时常量无法确定 → 保守失败**（不假装检查通过）。8 种形态的虚拟源码片段测试在 `test_release_gate.py`。
+
+### 5qn.4 manifest 与 --verify：从"遍历 manifest"改为"以固定清单为准"
+
+评审关键指摘：`--verify` 只遍历 manifest 自己声明的文件，删掉一项就能"验证通过"。v1.8 的校验链：
+
+| 编号 | 检查 | 失败后果 |
+|---|---|---|
+| A | manifest JSON 可解析；`version`/`release_commit`/`workspace_clean`/`files` 齐备；SHA-256 为 64 位 hex | FAIL |
+| B | `set(files) == set(MANIFEST_FILES)`（13 文件，多/少/错路径均失败） | FAIL |
+| C | `workspace_clean is True` | FAIL |
+| D | `release_commit` 为存在的 commit（`git cat-file -t`） | FAIL |
+| E | `release_commit` 是 HEAD 的祖先（`merge-base --is-ancestor`，退出码判定） | FAIL |
+| F | 若 `release_commit != HEAD`：`git diff --name-only release_commit..HEAD` **严格等于** `{"build_manifest.json"}` | FAIL |
+| G | 逐文件 `git show release_commit:path` 取 blob 算 SHA-256 与 manifest 比对 | FAIL |
+| H | 工作区无未提交/未暂存改动 | FAIL |
+| I | 当前 HEAD 的文件内容再算一次 SHA-256 与 manifest 比对（双重保险） | FAIL |
+
+**回归测试用真实临时 Git 仓库**（`git init` + 真 commit），覆盖 12 个场景：完整通过 / 删文件项 / 加未知项 / 改哈希 / release_commit 不存在 / 非祖先 / 只改 manifest（应为 PASS）/ 改 Gateway（FAIL）/ 改 README（FAIL）/ dirty（FAIL）/ `workspace_clean=false`（FAIL）/ version 不符（FAIL）。**第五轮指出的"release_commit 正确但 HEAD 后续又提交了代码修改仍报通过"场景已关闭**（由 F + I 双重拦截）。
+
+### 5qn.5 首建档并发测试：Barrier 位置从请求入口移到"首次读取之后"
+
+v1.7 的测试 Barrier 在请求入口，只能保证同时开始，不能保证两个线程都读到空 Memory（B 可能读到 A 已写入的行）。v1.8 用 `monkeypatch` 包装 `db.get_student_memory`，用 `threading.local` 保证**每个线程仅在第一次读取时**同步：第一次读到 None → `barrier.wait()` → 放行写入；重试路径不再等待（避免死锁）。断言：两线程均未 409 失败、两个 weak_topic 都保留、version 递增、无超时、清理 Token 与 Memory。
+
+### 5qn.6 .env 加载优先级与 fail-closed
+
+优先用 `python-dotenv` 解析（项目已有依赖），无 dotenv 时回退手写解析器（仅支持 `KEY=VALUE` / `KEY="VALUE"` / `#` 注释，且代码注释已声明该范围）。构建子进程环境时：先剥离全部 `MYSQL_*` → 再注入 chemask `.env` → 非 MYSQL 变量（PATH 等）原样保留。**chemask `.env` 不存在且 shell 也无必要变量时 fail-closed**，绝不悄悄使用 shell 中遗留的旧库配置。日志只打印 `host:port/db`，永不打印 `MYSQL_PASSWORD`。
+
+### 5qn.7 发布流程固化为六阶段 + 生产对账工具
+
+新增 `--finalize-manifest` 子命令（阶段三）与 `ops/verify_deployment.py`（阶段六，服务器本地逐文件对账，纯 stdlib、不联网、不打印敏感值）。README 与本文档均按"同步+门禁 → 业务提交 → 固化 manifest → manifest 提交 → --verify → 部署对账"六阶段描述，并明确 `release_commit ≠ HEAD` 的合法条件（差异严格只有 `build_manifest.json`）。
+
+### 5qn.8 CI 与"绕过"的诚实边界
+
+新增 `.github/workflows/release-gate.yml`：语法检查 + AST/动态对账 + `--verify` + MySQL 8 service container 集成测试（隔离测试库，不使用生产凭据，`.env` 不入库）。但**branch protection / required status checks 属于仓库设置，代码无法自我强制**，需管理员手工开启——此事实已写入 README 与路线图 #9，不宣称"已强制"。
+
+### 5qn.9 本轮测试基线变化
+
+新增 `tests/test_release_gate.py`（44 例）后，总基线从 38 → **82**。README 徽章、README 目录说明、DESIGN §3.8/§8/§4 现状描述、`CURRENT_TESTS` 全部同步；历史章节中 v1.5/v1.6/v1.7 的 37/38 保留并标注所属版本。
+
+---
+
 ## 6. 一轮评审修复记录（v1.3，2026-10-30）
 
 收到一份高质量外部评审（判 6/10 生产级），逐条核实后修复情况：
@@ -440,9 +505,11 @@ chem-mcp/
 ├── ops/
 │   ├── mcp_migrate.py    # DDL 迁移（幂等，含 v1.3 三项升级与存量数据搬迁）
 │   ├── mcp_token.py      # Token 签发/吊销/列表 CLI（--role teacher）
-│   └── mcp_echo_server.py# 平台连通性验证用最小 MCP 服务器（零业务依赖）
+│   ├── mcp_echo_server.py# 平台连通性验证用最小 MCP 服务器（零业务依赖）
+│   └── verify_deployment.py # 生产部署逐文件 SHA-256 对账（六轮新增）
 ├── tests/
-│   └── test_mcp_gateway.py  # 37 用例：协议/鉴权/吊销/限流语义(含并发)/并发幂等/JSON 合法性与硬上限/乐观锁/RBAC
+│   ├── test_mcp_gateway.py   # 38 例（本文件）：协议/鉴权/吊销/限流语义(含并发)/并发幂等/JSON 合法性与硬上限/乐观锁/并发首建档/RBAC
+│   └── test_release_gate.py  # 44 例（本文件）：发布门禁回归测试（章节豁免/动态对账/AST 扫描/manifest 临时仓库/.env 注入）
 ├── DESIGN.md             # 本文档
 └── README.md             # 快速概览
 ```
