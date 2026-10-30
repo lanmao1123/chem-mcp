@@ -12,7 +12,10 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gateway.db import get_conn  # noqa: E402
+try:                                    # chem-mcp 仓库布局（gateway 包）
+    from gateway.db import get_conn  # noqa: E402
+except ModuleNotFoundError:             # 服务器 chemask 布局（app 包）
+    from app.db import get_conn  # noqa: E402
 
 DDL = [
     """CREATE TABLE IF NOT EXISTS api_keys (

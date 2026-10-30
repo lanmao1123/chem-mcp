@@ -307,6 +307,25 @@ def test_ast_from_import():
     assert sync.scan_ast_imports("from prep.x import y\n", "t.py")
 
 
+def test_ast_guarded_fallback_allowed():
+    """try/except ModuleNotFoundError 的布局兼容回退导入 → 放行（v1.8）"""
+    src = ("try:\n"
+           "    from gateway.db import get_conn\n"
+           "except ModuleNotFoundError:\n"
+           "    from app.db import get_conn\n")
+    assert sync.scan_ast_imports(src) == []
+
+
+def test_ast_guard_without_import_error_still_flagged():
+    """try/except ValueError 里放旧导入 → 仍然拦截（守卫条件不成立）"""
+    src = ("try:\n"
+           "    from app import db\n"
+           "except ValueError:\n"
+           "    pass\n")
+    probs = sync.scan_ast_imports(src)
+    assert probs, "非 ImportError 守卫不得豁免"
+
+
 def test_ast_deferred_import():
     src = ("def worker():\n    import app.mcp_gateway\n"
            "class C:\n    def m(self):\n        from prep import z\n")

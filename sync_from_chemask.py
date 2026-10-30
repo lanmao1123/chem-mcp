@@ -65,16 +65,18 @@ MANIFEST_FILES = [
 
 # ── 版本基线（升级版本时必须同步更新此处 + README 徽章 + DESIGN 头部 + 全部文档）──
 CURRENT_VERSION = "1.8"
-CURRENT_TESTS = 82          # 38 (test_mcp_gateway.py) + 44 (test_release_gate.py)
+CURRENT_TESTS = 84          # 38 (test_mcp_gateway.py) + 46 (test_release_gate.py)
 CURRENT_TOOLS = ["get_profile", "update_profile", "save_memory", "record_attempt",
                  "list_mistakes", "get_mastery", "class_summary", "get_report",
                  "save_report"]
 
 # ── 兜底正则（非徽章位置的历史串；徽章/版本/测试数/工具清单由动态对账精确校验）────
+# scope: "all" = 全部文件；"docs" = 仅文档（.py 的导入检查交给 AST 扫描，
+# 因为 AST 能识别"except ImportError 守卫内的布局兼容回退"，文本正则不能）
 STALE_PATTERNS = [
-    (r"-m app\.mcp_gateway", "仓库侧旧启动命令 app.mcp_gateway"),
-    (r"^\s*(from|import) (app|prep)\b", "旧 import 路径"),
-    (r"30 个测试用例|30 用例：|7 个白名单 MCP|8 个白名单工具\*\*", "v1.2/v1.4 历史旧串"),
+    (r"-m app\.mcp_gateway", "仓库侧旧启动命令 app.mcp_gateway", "all"),
+    (r"^\s*(from|import) (app|prep)\b", "旧 import 路径", "docs"),
+    (r"30 个测试用例|30 用例：|7 个白名单 MCP|8 个白名单工具\*\*", "v1.2/v1.4 历史旧串", "all"),
 ]
 
 # DESIGN 历史修复章节：H2 标题【精确匹配】白名单（伪造"## 5. 快速开始"不豁免）
@@ -128,7 +130,9 @@ def step4_scan():
             txt = open(fp, encoding="utf-8").read()
             design_exempt = get_design_exempt_lines(txt) if rel == "DESIGN.md" else set()
             lines = txt.splitlines()
-            for pat, desc in STALE_PATTERNS:
+            for pat, desc, scope in STALE_PATTERNS:
+                if scope == "docs" and f.endswith(".py"):
+                    continue  # .py 导入由 AST 扫描负责（含守卫豁免逻辑）
                 for m in re.finditer(pat, txt, re.M):
                     ln = txt.count("\n", 0, m.start())
                     if rel == "DESIGN.md" and ln in design_exempt:
@@ -356,13 +360,44 @@ def scan_ast_imports(source: str, filename: str = "<src>"):
                     if a.name == "import_module":
                         func_aliases.add(a.asname or "import_module")
 
+    # 守卫豁免（v1.8）：try: from gateway... except (ModuleNotFoundError|ImportError):
+    # from app... —— 布局兼容回退，不是仓库侧对 chemask 布局的依赖。
+    guarded = set()
     for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        catches_import = False
+        for h in node.handlers:
+            names = []
+            if isinstance(h.type, ast.Name):
+                names = [h.type.id]
+            elif isinstance(h.type, ast.Tuple):
+                names = [e.id for e in h.type.elts if isinstance(e, ast.Name)]
+            if {"ImportError", "ModuleNotFoundError"} & set(names):
+                catches_import = True
+        if not catches_import:
+            continue
+        # 回退导入通常写在 except 体内（try: gateway / except ImportError: app）
+        stmts = list(node.body)
+        for h in node.handlers:
+            stmts.extend(h.body)
+        for stmt in stmts:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    guarded.add((sub.lineno, sub.col_offset))
+
+    for node in ast.walk(tree):
+        in_guard = (getattr(node, "lineno", -1), getattr(node, "col_offset", -1)) in guarded
         # 普通/延迟 import
         if isinstance(node, ast.Import):
+            if in_guard:
+                continue
             for a in node.names:
                 if _legacy(a.name):
                     problems.append(f"{filename}:{node.lineno}: import {a.name}")
         elif isinstance(node, ast.ImportFrom):
+            if in_guard:
+                continue
             if node.level == 0 and node.module and _legacy(node.module):
                 problems.append(f"{filename}:{node.lineno}: from {node.module} import ...")
         # 动态导入：X.import_module("...") / __import__("...") / 别名调用
@@ -438,12 +473,8 @@ def step3_rewrite():
         "运行（本地，gateway 包路径，uvicorn）：\n"
         "    uvicorn gateway.mcp_gateway:app --host 127.0.0.1 --port 8721\n")
     open(gp, "w", encoding="utf-8").write(t)
-    for f in ("ops/mcp_token.py", "ops/mcp_migrate.py"):
-        fp = os.path.join(HERE, f)
-        t = open(fp, encoding="utf-8").read()
-        t = t.replace("from app import db", "from gateway import db")
-        t = t.replace("from app.db import get_conn", "from gateway.db import get_conn")
-        open(fp, "w", encoding="utf-8").write(t)
+    # ops 脚本自 v1.8 起用"双布局导入"（try gateway / except ModuleNotFoundError: app），
+    # 仓库侧与服务器侧字节一致，不再做 import 改写（否则会把兜底分支一起替换掉）。
     tp = os.path.join(HERE, "tests", "test_mcp_gateway.py")
     s = open(tp, encoding="utf-8").read()
     s = s.replace("from app import db\nfrom app.mcp_gateway import",

@@ -27,7 +27,10 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gateway import db  # noqa: E402
+try:                                    # chem-mcp 仓库布局（gateway 包）
+    from gateway import db  # noqa: E402
+except ModuleNotFoundError:             # 服务器 chemask 布局（app 包）
+    from app import db  # noqa: E402
 
 
 def _new_token() -> str:
