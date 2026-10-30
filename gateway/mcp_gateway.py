@@ -10,8 +10,8 @@ list_mistakes/get_mastery/class_summary）+ 2 报告通道（get_report/save_rep
   - 只暴露白名单工具，不透传任意 SQL
   - MCP 超时/异常统一返回结构化错误，专家侧提示词有降级话术
 
-运行（本地测试）：
-    ./.venv/bin/python -m app.mcp_gateway --port 8765
+运行（本地，gateway 包路径，uvicorn）：
+    uvicorn gateway.mcp_gateway:app --host 127.0.0.1 --port 8721
 生产（服务器）：
     systemd + nginx /chem-mcp/ 反代（部署需另行确认）
 """
