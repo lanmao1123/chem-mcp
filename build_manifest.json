@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-10-30T10:13:12+00:00",
+  "generated_at": "2026-10-30T10:34:00+00:00",
   "version": "1.8",
-  "release_commit": "21f6d0c20f6f3dd2b380741a9c780926fa3dcd28",
+  "release_commit": "c8153159ce379454f66f1bf0bc02fa705e260675",
   "workspace_clean": true,
   "files": {
     "gateway/mcp_gateway.py": "c13d61929a355d0174abe070ea2b49176089530efe18e6d2168942821e26316e",
@@ -11,7 +11,7 @@
     "ops/mcp_migrate.py": "3245f8c961d829f6f424f109d78bd63e80f5c3a5d75f165662f10f88fcacf6c9",
     "ops/mcp_token.py": "c7fa617f4359bc9f98d4150e535130ce62d56bbd9419c1e35ed9a34213e4197f",
     "ops/mcp_echo_server.py": "17c407c242c2be6b2dd4e59237a4b02a706264e00723027ec94bcb16fc074305",
-    "ops/verify_deployment.py": "75c4338ca6be465ab58888d71aa7fde12c40d226bebec944b03c0dca069eda70",
+    "ops/verify_deployment.py": "2ca28709521f317cfa1abbcfb588b9a21a2a1fbd1ab13a54437fed07218324ed",
     "README.md": "f9036ac4711165e71e326fdbdc3396263f170c9aa8201b9d37756c324e680178",
     "DESIGN.md": "7f1c8b01461e08b1a386ea64ed7e28966ca4bac269b8bb4c1a98aff6db855e12",
     "requirements-release.txt": "49d2c80ca90452ed18a1ff5a46f3b370df3ef30d5e97c25035d1de23d7b09c16",
