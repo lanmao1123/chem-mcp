@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-30T07:29:23+00:00",
+  "generated_at": "2026-10-30T07:30:35+00:00",
   "version": "1.7",
-  "release_commit": "02fc71b6251cecf1ab39a5176e8072b195c882fc",
-  "workspace_clean": false,
+  "release_commit": "32dd0d3f08e412a641b14ee77e79868b9552eded",
+  "workspace_clean": true,
   "files": {
     "gateway/mcp_gateway.py": "2559ac36eaf6699bbaa1134af499f2c2e2b9704770faf9c5cfb4ff9cdbdbb6e3",
     "gateway/db.py": "17543be03ef4b89e8ed119bbd129866b7afee8b75a654aa53535396ea53fc662",
