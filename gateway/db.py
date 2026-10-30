@@ -660,12 +660,16 @@ def touch_api_key(key_id: int):
 
 
 def rate_count_last_hour(key_id: int) -> int:
-    """网关业务调用计数（原子版）：先插入本次调用，再统计窗口内总数——
-    单条 INSERT 原子占位，并发请求不会同时读到相同旧计数（v1.2 是 SELECT 后
-    INSERT 两步，并发下配额可被多请求同时通过）。
-    返回包含本次调用的窗口计数，达到限额时调用方拒绝（本次已计数，无需补插）。"""
+    """网关业务调用计数（并发安全版 v1.5）：
+    事务内先 SELECT api_keys 行 FOR UPDATE（行锁串行化同一 Token 的并发请求），
+    再 INSERT 本次计数并统计窗口。commit 在 get_conn 上下文退出时执行，异常回滚。
+    教训（三轮评审）：v1.4 的 insert-before-count 在 InnoDB REPEATABLE READ 下，
+    并发事务互相看不到对方未提交的 INSERT，两个请求可同时读到相同计数穿透配额——
+    计数的"原子性"必须靠锁串行化保证，单纯调整语句顺序无效。"""
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 行锁：同一 key 的并发请求在此串行等待，锁持有至事务提交
+            cur.execute("SELECT id FROM api_keys WHERE id=%s FOR UPDATE", (key_id,))
             cur.execute("INSERT INTO api_key_calls(key_id) VALUES (%s)", (key_id,))
             cur.execute(
                 "SELECT COUNT(*) AS n FROM api_key_calls"

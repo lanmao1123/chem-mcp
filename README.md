@@ -11,7 +11,7 @@
 平台原生没有作答数据层、不向专家暴露召唤者身份——本项目用一个薄 MCP 网关把两块短板都补上：
 
 - **Token ↔ 学生硬绑定**：一人一 Token（只存 SHA-256），网关反查即知身份；**student_id 由网关注入，不信任 LLM 传参**（防跨学生数据泄露）
-- **8 个白名单工具**：get_profile / update_profile / save_memory / record_attempt / list_mistakes / get_mastery / class_summary（仅教师 role）/ get_report / **save_report（幂等）**
+- **9 个白名单工具**：get_profile / update_profile / save_memory / record_attempt / list_mistakes / get_mastery / class_summary（仅教师 role）/ get_report / save_report（幂等） / **save_report（幂等）**
 - **长期记忆三层设计**：`student_memory` 一人一行摘要（增量合并：卡点并集、计划覆盖、taught_topics 防重复讲解）+ dialogue_log / attempts / reports 明细可回溯
 - **并发正确性**（v1.3）：`record_attempt` 幂等由 `UNIQUE(student_id,qid,idem_key)` 原子保证；记忆更新走 version 乐观锁 + 自动重试，杜绝并发 Lost Update
 - **输出治理**（v1.3）：get_profile 结构化裁剪至 3K 字符，**任何输入都返回合法 JSON**；报告全文按需经 get_report 拉取
@@ -52,7 +52,7 @@ WorkBuddy 及标准宿主走 **Streamable HTTP**，自研服务端必须同时�
 3. **通知**：无 `id` 字段的 JSON-RPC 通知（如 `notifications/initialized`）必须返回 **202 空体**，返回 400 会让客户端中断握手
 4. **限流语义**：只对 `tools/call` 计费。保活/轮询流量计入配额 = 系统自我拒绝服务（实测 WorkBuddy 连接器以 ~3s 间隔轮询）
 
-> **定位声明**：本项目是 *MCP-compatible data gateway for a specific production client*（WorkBuddy 连接器），协议面按其真实行为适配并经 30 个测试锁定；非 MCP 参考实现。协议层与工具层完全解耦，需兼容更多宿主时可平滑迁移至官方 SDK（工具实现零改动）。详见 DESIGN.md §3.8。
+> **定位声明**：本项目是 *MCP-compatible data gateway for a specific production client*（WorkBuddy 连接器），协议面按其真实行为适配并经 37 个测试锁定；非 MCP 参考实现。协议层与工具层完全解耦，需兼容更多宿主时可平滑迁移至官方 SDK（工具实现零改动）。详见 DESIGN.md §3.8。
 
 ## 快速开始
 

@@ -1,6 +1,6 @@
 # chem-mcp 技术方案与设计背景
 
-> 版本：v1.4 ｜ 更新：2026-10-30（二轮外部评审修复） ｜ 状态：生产运行中（单实例试点规模）
+> 版本：v1.5 ｜ 更新：2026-10-30（三轮外部评审修复：限流行锁串行化/Memory 同源读取/首建档修复/长度硬上限） ｜ 状态：生产运行中（单实例试点规模）
 > 本文档面向审查者：完整交代项目背景、要解决的问题、每个关键设计决策的动机、已知取舍与未解决问题。配套代码全部在本仓库内。
 
 ---
@@ -58,7 +58,7 @@ chem-mcp Gateway（本仓库 gateway/）
 **关键取舍：网关直连 MySQL，而不是经 chemask HTTP API。** 三点理由：
 
 1. **部署拓扑**：网关与 chemask 同机（同一台服务器、同一个 MySQL 实例），HTTP 中间层只增加一跳延迟与故障点，无隔离收益；
-2. **错误语义**：8 个工具需要细粒度的数据库级错误映射（唯一键冲突=幂等重复、行版本不符=乐观锁冲突），跨 HTTP 层传递这些语义要设计一套错误协议；
+2. **错误语义**：9 个工具需要细粒度的数据库级错误映射（唯一键冲突=幂等重复、行版本不符=乐观锁冲突），跨 HTTP 层传递这些语义要设计一套错误协议；
 3. **事务边界**：乐观锁的"确保行存在 + 条件 UPDATE"必须在同一连接事务内完成，跨服务拆开会引入分布式一致性问题，收益为零。
 
 代价是网关与 chemask 共享 db.py 口径（我们用同一份代码文件保证）。**评审曾指出 README"经 chemask API"的表述与代码不符——实际是文档错误，架构意图就是本节的直连方案，现已更正。**
@@ -188,8 +188,8 @@ WHERE student_id=%s AND version=%s    -- rowcount==0 → 冲突
    - `notifications/initialized`（无 id 通知）必须返回 202 空体（返回 400 会让客户端中断握手陷入重连循环）；
    - 短流 SSE 会触发 3 秒重连风暴，需长流 + 心跳。
    官方 SDK 对这些边缘行为（尤其非标准客户端的容错）是黑盒；手写层让我们在 10 分钟内定位并修复每一次故障，修复版本当天上线。
-2. **协议面极小**。本网关只需 `initialize` / `tools/list` / `tools/call` / notifications 四个方法，无 resources/prompts/sampling 等能力。手写面 ≈ 60 行路由代码，且有 30 个测试用例锁定行为。
-3. **迁移路径已预留**。`_TOOL_IMPL` 字典是唯一的工具注册点，协议层与工具层完全解耦——若后续需要官方 SDK（例如要兼容更多 MCP 宿主），只需替换路由层，8 个工具实现零改动。
+2. **协议面极小**。本网关只需 `initialize` / `tools/list` / `tools/call` / notifications 四个方法，无 resources/prompts/sampling 等能力。手写面 ≈ 60 行路由代码，且有 37 个测试用例锁定行为。
+3. **迁移路径已预留**。`_TOOL_IMPL` 字典是唯一的工具注册点，协议层与工具层完全解耦——若后续需要官方 SDK（例如要兼容更多 MCP 宿主），只需替换路由层，9 个工具实现零改动。
 
 **诚实的定位声明**：本项目是 *MCP-compatible data gateway for a specific production client*，不是 *reference MCP server implementation*。若你的目标是后者，请以官方 SDK 为准——这也是我们 README 不宣称"标准 MCP 实现"的原因。
 
@@ -233,7 +233,7 @@ MySQL              = 状态层：唯一真相
 |---|---|---|---|
 | 1 | v1.3 四项修复未接入仓库网关/测试 | ✅ **属实（同步事故）** | 仓库全量同步至生产版本（`gateway/mcp_gateway.py`、`tests/` 逐字节一致），33/33 测试在仓库 import 路径下通过 |
 | 2 | 缺 `save_report`：报告生成后无处持久化，数据闭环断裂 | ✅ 属实 | **新增第 9 个工具**：`save_report(report_type, content_md, report_key)`，`UNIQUE(student_id, report_key)` 原子幂等（Agent 重试只落一份）；专家提示词同步规则"**必须等 save_report 返回成功才能宣称已存档**" |
-| 3 | 限流计数 SELECT→INSERT 非原子，并发可穿越配额 | ✅ 属实 | **已修**：改为 insert-before-count（先原子占位再统计），边界语义同步修正为"计数 > 限额"（限额 N = 窗口内恰好 N 次放行），429 路径天然计数 |
+| 3 | 限流计数 SELECT→INSERT 非原子，并发可穿越配额 | ✅ 属实 | **部分修**：已改 insert-before-count 并修正边界为"计数 > 限额"；但三轮评审指出 InnoDB REPEATABLE READ 下未提交 INSERT 对并发事务不可见，仍可穿透配额 → **v1.5 已改行锁串行化**（见 §5bis），本项至此真正修复 |
 | 4 | Expert Prompt 与工具 schema 不一致（save_memory 无 target_grade 参数；报告存档话术提前） | ✅ 属实 | **已修**：提示词明确"目标等级/分数段/卷型变化走 update_profile"；报告存档流程改为"save_report 成功后才宣称" |
 | 5 | 重名学生 create_student INSERT IGNORE 返回同一 student_id → 数据串号 | ✅ 属实（schema 已有 user_id 列但签发流程未用） | **列入 P1**（需要业务层注册流程配合，见路线图 #8）；当前试点用"报名字+教师对名单"人工兜底 |
 | 6 | class_summary 无班级权限边界，teacher 可看全表 | ✅ 属实（设计如此） | **列入 P1**（路线图 #6：teacher_classes 关联表）；试点期教师=管理员，文档已声明 |
@@ -248,6 +248,52 @@ MySQL              = 状态层：唯一真相
 ```
 
 学情报告闭环就此完整：**生成（LLM）→ save_report 落库（幂等）→ get_profile 带出摘要 → get_report 按需全文**。
+
+---
+
+## 5bis. 三轮评审修复记录（v1.5，2026-10-30）
+
+第三轮审查判定：同步完整性/save_report/Prompt 三组 PASS；**限流原子性 FAIL**（find 到了真正的并发漏洞）、**文档一致性 FAIL**（旧数字残留）。全部处置如下：
+
+### 5b.1 限流并发原子化（本轮最重要修复）
+
+**评审指出的漏洞（完全属实）**：v1.4 的 insert-before-count 在 InnoDB `REPEATABLE READ` 隔离级别下，并发事务**互相看不到对方未提交的 INSERT**——两个请求可同时读到相同计数、同时通过配额判定。单纯调整语句顺序不构成原子性，v1.4 的"原子占位"表述是错的（已在 §5 修正）。
+
+**v1.5 修复：行锁串行化**
+
+```sql
+START TRANSACTION;                          -- get_conn 上下文
+SELECT id FROM api_keys WHERE id=%s FOR UPDATE;   -- 行锁：同一 Token 的并发请求在此排队
+INSERT INTO api_key_calls(key_id) VALUES (%s);
+SELECT COUNT(*) ... WHERE called_at > NOW() - INTERVAL 1 HOUR;
+COMMIT;                                     -- 释放锁，后续请求可见已提交计数
+```
+
+同一 Token 的并发请求被 `FOR UPDATE` 强制串行：后到者必须等前者提交后才能统计（此时能看到前者的计数）。不同 Token 互不阻塞（锁粒度=单行）。
+
+**并发测试**（评审明确要求的形态）：`test_rate_limit_concurrent_serialized` —— 6 线程 Barrier 同步、限额 1，断言恰好 1 个 200 + 5 个 429。真实 MySQL 上通过。
+
+### 5b.2 Memory 乐观锁读取时序（评审新发现，属实）
+
+**漏洞**：`_save_memory_locked` 先 `get_student_memory()` 再 `get_memory_version()`——两次独立事务。竞态：A 读到旧内容(v1) → B 写入并推版本 → A 再读到新版本号(v2) → A 用**旧内容+新版本号**做条件更新 → 成功，B 的更新被覆盖。
+
+**修复**：内容与版本改为**同一次 SELECT**（`get_student_memory` 返回的行自带 `version` 列，`mem.get("version")` 即条件更新依据）。内容旧则版本必旧，条件更新必失败，触发重试重读。`_save_memory_locked`/`_update_profile_locked`/`_auto_solve_on_repeat_success` 三处全部改为同源读取。
+
+### 5b.3 新学生首次建档丢 weak_topics（评审新发现，属实）
+
+**漏洞**：`_update_profile_locked` 中 `ver is None` 分支直接 upsert fields，不含 weak_topics 合并——新学生首次 `update_profile` 传入的卡点列表被静默丢弃。
+
+**修复**：weak_topics 归一化（字符串→`{"topic","status":"open"}`）移到版本判断之外，首建档同样写入。测试 `test_first_profile_with_weak_topics_not_lost` 锁定。
+
+### 5b.4 get_profile 长度硬上限（评审：合法 ≠ 受控）
+
+裁剪计划扩展至全部可膨胀字段（preferences 整块丢弃、weak_topics/taught_topics 条数与单项长度、exam_board/plan_stage/current_score/target_grade/summary 逐级收缩）；新增**终极兜底**：计划走完仍超限时输出仅含 `student_id + stale + truncated:true` 的保护性 JSON——**任何输入下输出必 ≤3000 字符且为合法 JSON**。测试 `test_trim_never_exceeds_hard_limit` 用 9000 字符巨型字段验证。
+
+### 5b.5 文档对账（评审列出的 7 处旧数字全部修正）
+
+README"8 个白名单工具"→9、README"30 个测试"→37、DESIGN §2/§3.8/§8 三处 30→37、"8 个工具"→9、网关模块 docstring"7 个工具/app.db"→"9 个工具/db.py"。§5 限流行表述已更正为如上诚实版本（不再声称 v1.4 已完成原子限流）。
+
+**关于"生产-仓库逐字节一致"的验证方式**：评审正确指出其无法独立验证。我们的对账方式是 `diff` 本地两份文件 + 在仓库布局下跑完整测试套件（本版 37/37 于 chem-mcp/ 目录通过）。CI 落地前，这是人工流程；路线图 #9 的 GitHub Actions 即为此而设。
 
 ---
 
@@ -299,7 +345,7 @@ pytest tests/test_mcp_gateway.py -q
 ```
 chem-mcp/
 ├── gateway/
-│   ├── mcp_gateway.py    # MCP 网关：路由/鉴权/RBAC/限流/8 工具/裁剪/乐观锁重试
+│   ├── mcp_gateway.py    # MCP 网关：路由/鉴权/RBAC/限流/9 工具/裁剪/乐观锁重试
 │   └── db.py             # 数据层：连接池/5 张 MCP 表/原子幂等/乐观锁 upsert
 ├── expert-package/       # 「CIE化学考情教练」专家包（plugin.json + 提示词 v3 + 安装指南）
 ├── ops/
@@ -307,7 +353,7 @@ chem-mcp/
 │   ├── mcp_token.py      # Token 签发/吊销/列表 CLI（--role teacher）
 │   └── mcp_echo_server.py# 平台连通性验证用最小 MCP 服务器（零业务依赖）
 ├── tests/
-│   └── test_mcp_gateway.py  # 30 用例：协议/鉴权/吊销/限流语义/并发幂等/JSON 合法性/乐观锁/RBAC
+│   └── test_mcp_gateway.py  # 37 用例：协议/鉴权/吊销/限流语义(含并发)/并发幂等/JSON 合法性与硬上限/乐观锁/RBAC
 ├── DESIGN.md             # 本文档
 └── README.md             # 快速概览
 ```

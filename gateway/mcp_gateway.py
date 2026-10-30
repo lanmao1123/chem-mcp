@@ -1,6 +1,8 @@
-"""MCP 网关：把 chemask 数据层暴露为 7 个白名单 MCP 工具（v1.2 方案 §8.4）。
+"""MCP 网关：把学生数据层暴露为 9 个白名单 MCP 工具（v1.2 方案 §8.4，v1.5 评审加固）。
 
-链路：WorkBuddy 专家 → MCP 连接器（HTTPS + Bearer Token）→ 本网关 → app.db → MySQL
+9 工具 = 7 核心（get_profile/update_profile/save_memory/record_attempt/
+list_mistakes/get_mastery/class_summary）+ 2 报告通道（get_report/save_report）。
+链路：WorkBuddy 专家 → MCP 连接器（HTTPS + Bearer Token）→ 本网关 → db.py → MySQL
 安全设计：
   - Token 只存 SHA-256 哈希（api_keys.token_hash），明文仅签发时展示一次
   - 每次调用：鉴权 → 吊销检查 → 限流（rate_limit_h 次/小时）→ 记 last_used_at
@@ -217,9 +219,12 @@ def _merge_weak_topics(current: list, new_topic: str | None,
 
 def _trim_to_limit(payload: dict, limit: int = _PROFILE_LIMIT) -> str:
     """结构化裁剪：按字段优先级收缩，直到序列化结果 ≤ limit。
-    教训：对 json.dumps 结果做字符串截断会产生非法 JSON（截断花括号/引号），
+    教训一：对 json.dumps 结果做字符串截断会产生非法 JSON（截断花括号/引号），
     客户端 json.loads 直接炸——裁剪必须在"构建 payload"阶段做，而不是"序列化后"做。
-    优先级（保留→收缩）：身份 > stale > weak_topics > plan_stage > 对话 > 报告摘要 > summary > taught"""
+    教训二（三轮评审）：JSON 合法 ≠ 长度受控——preferences 对象、单条超长卡点、
+    exam_board 等字段不在裁剪计划内时，计划走完仍可能超限。
+    最终兜底：剔除非关键可变字段后若仍超限，对剩余大字段做保守收缩；
+    student_id 与 stale 永不丢弃，输出永远是合法 JSON。"""
     def shrink(payload: dict, key_path: list, cap: int):
         node = payload
         for k in key_path[:-1]:
@@ -239,6 +244,16 @@ def _trim_to_limit(payload: dict, limit: int = _PROFILE_LIMIT) -> str:
         (("memory", "summary"), 150),
         (("memory", "taught_topics"), 8),
         (("memory", "weak_topics"), 10),
+        # v1.5：覆盖剩余可膨胀字段
+        (("memory", "preferences"), None),   # 教学偏好整块丢弃（可重建）
+        (("memory", "weak_topics"), 5),
+        (("memory", "plan_stage"), 60),
+        (("memory", "exam_board"), 32),
+        (("memory", "current_score"), 16),
+        (("memory", "target_grade"), 8),
+        (("memory", "summary"), 50),
+        (("memory", "taught_topics"), 3),
+        (("memory", "weak_topics"), 3),
     ]
     blob = json.dumps(payload, ensure_ascii=False)
     for path, cap in plan:
@@ -253,7 +268,16 @@ def _trim_to_limit(payload: dict, limit: int = _PROFILE_LIMIT) -> str:
         else:
             shrink(payload, path, cap)
         blob = json.dumps(payload, ensure_ascii=False)
-    return blob  # 极端兜底：计划走完仍超限，也返回合法 JSON（只超长度，不破坏结构）
+
+    # 终极兜底：全部计划走完仍超限（理论难达，防御极端输入）——
+    # 丢弃 memory 可变字段，只留身份与 stale，重新序列化（合法 JSON 且必小于 limit）
+    if len(blob) > limit:
+        core = {"student_id": payload.get("student_id"),
+                "memory": {"stale": (payload.get("memory") or {}).get("stale", True)},
+                "truncated": True,
+                "hint": "profile 过大被保护性裁剪，字段明细请分次查询"}
+        blob = json.dumps(core, ensure_ascii=False)
+    return blob
 
 
 def tool_get_profile(student_id: int) -> dict:
@@ -320,15 +344,24 @@ def _retry_on_conflict(fn):
 
 @_retry_on_conflict
 def _update_profile_locked(student_id: int, fields: dict, weak_add: list[str] | None):
-    ver = db.get_memory_version(student_id)
+    # v1.5（三轮评审）：内容与 version 必须来自同一次 SELECT——
+    # 分两次读会拿到"最新版本号+旧内容"，条件更新反而成功，Lost Update 复活
+    mem = db.get_student_memory(student_id) or {}
+    ver = mem.get("version")
     if ver is not None:
         if weak_add:
-            weak = _load_json((db.get_student_memory(student_id) or {}).get("weak_topics"))
+            weak = _load_json(mem.get("weak_topics"))
             for t in weak_add:
                 weak = _merge_weak_topics(weak, t, None)
             fields = {**fields, "weak_topics": weak}
         db.upsert_student_memory(student_id, expected_version=ver, **fields)
     else:
+        # 新学生首次建档：weak_topics 合并逻辑同样执行（v1.5 修复：
+        # 原实现 ver 为 None 时直接 upsert fields，首次传入的 weak_topics 会丢失）
+        if weak_add:
+            fields = {**fields,
+                      "weak_topics": [{"topic": t.strip(), "status": "open"}
+                                      for t in weak_add if t.strip()]}
         db.upsert_student_memory(student_id, **fields)
 
 
@@ -343,8 +376,9 @@ def tool_update_profile(student_id: int, args: dict) -> dict:
 
 @_retry_on_conflict
 def _save_memory_locked(student_id: int, args: dict) -> dict:
+    # v1.5：mem 与 version 同源（单次 SELECT * 包含 version 列）
     mem = db.get_student_memory(student_id) or {}
-    ver = db.get_memory_version(student_id)
+    ver = mem.get("version")
     weak = _load_json(mem.get("weak_topics"))
     taught = _load_json(mem.get("taught_topics"))
     patch: dict = {}
@@ -424,7 +458,7 @@ def _auto_solve_on_repeat_success(student_id: int, qid: str):
     if not topic:
         return
     mem = db.get_student_memory(student_id) or {}
-    ver = db.get_memory_version(student_id)
+    ver = mem.get("version")  # v1.5：与内容同源
     weak = _load_json(mem.get("weak_topics"))
     merged = _merge_weak_topics(weak, None, topic)
     if merged != weak:

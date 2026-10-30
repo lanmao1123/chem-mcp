@@ -532,3 +532,85 @@ def test_rate_count_is_atomic_precount(student):
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM api_key_calls WHERE key_id=%s", (key_id,))
                 cur.execute("DELETE FROM api_keys WHERE id=%s", (key_id,))
+
+
+# ---------------- v1.5（三轮评审修复）----------------
+
+def test_rate_limit_concurrent_serialized(student):
+    """并发限流串行化（三轮评审要求）：限额 1 时，N 个并发请求只放行 1 个。
+    行锁 FOR UPDATE 使同一 Token 的配额判定串行执行，
+    REPEATABLE READ 下未提交计数不可见的问题被锁排队消除。"""
+    raw = "ck_v15_" + secrets.token_urlsafe(12)
+    key_id = db.issue_api_key(student, _token_hash(raw), label="v15",
+                              rate_limit_h=1)
+    try:
+        results, barrier = [], threading.Barrier(6)
+
+        def worker():
+            barrier.wait()
+            r = _call("tools/call", None,
+                      {"name": "get_profile", "arguments": {}}, raw_token=raw)
+            results.append(r.status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert results.count(200) == 1, f"放行了 {results.count(200)} 次: {results}"
+        assert results.count(429) == 5
+    finally:
+        db.revoke_api_key(_token_hash(raw))
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM api_key_calls WHERE key_id=%s", (key_id,))
+
+
+def test_first_profile_with_weak_topics_not_lost(student, token):
+    """新学生首次 update_profile 带 weak_topics：不能因无 version 走无锁路径而丢失"""
+    raw = "ck_v15f_" + secrets.token_urlsafe(12)
+    db.issue_api_key(student, _token_hash(raw), label="v15f")
+    try:
+        db.clear_student_memory(student)
+        _tool("update_profile",
+              {"exam_board": "9701/22", "target_grade": "a",
+               "weak_topics": ["有机化学", "物理化学"]}, raw)
+        mem = db.get_student_memory(student)
+        weak = db._load_json_helper(mem["weak_topics"]) if hasattr(
+            db, "_load_json_helper") else __import__("json").loads(mem["weak_topics"])
+        topics = {w["topic"] for w in weak}
+        assert {"有机化学", "物理化学"} <= topics, f"首次建档丢卡点: {weak}"
+    finally:
+        db.revoke_api_key(_token_hash(raw))
+        db.clear_student_memory(student)
+
+
+def test_memory_version_single_read_consistency(student):
+    """Memory 内容与 version 同源：mem['version'] 即条件更新依据（三轮评审时序问题）"""
+    db.upsert_student_memory(student, summary="s1")
+    mem = db.get_student_memory(student)
+    # SELECT * 必须包含 version 列（同源读取的前提）
+    assert "version" in mem
+    ver = mem["version"]
+    db.upsert_student_memory(student, expected_version=ver, summary="s2")
+    assert db.get_student_memory(student)["version"] == ver + 1
+    db.clear_student_memory(student)
+
+
+def test_trim_never_exceeds_hard_limit():
+    """任意恶意输入（巨型 preferences/超长字段）：输出 ≤3000 且 JSON 合法，
+    student_id 与 stale 保留（三轮评审：JSON 合法 ≠ 长度受控）"""
+    import json as _json
+    payload = {"student_id": 42,
+               "memory": {"stale": False,
+                          "preferences": {"huge": "P" * 9000, "x": list(range(500))},
+                          "summary": "s" * 9000,
+                          "exam_board": "9" * 500,
+                          "plan_stage": "p" * 500,
+                          "weak_topics": [{"topic": "w" * 2000, "status": "open"}] * 50,
+                          "taught_topics": ["t" * 1000] * 100},
+               "recent_dialogues": [{"role": "student", "digest": "d" * 900}] * 20,
+               "latest_report": {"summary": "r" * 9000}}
+    text = _trim_to_limit(payload, 3000)
+    p = _json.loads(text)
+    assert len(text) <= 3000, f"超出硬限制: {len(text)}"
+    assert p["student_id"] == 42
+    assert "stale" in p["memory"]
