@@ -14,8 +14,8 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from app import db
-from app.mcp_gateway import app, _merge_weak_topics, _token_hash
+from gateway import db
+from gateway.mcp_gateway import app, _merge_weak_topics, _token_hash
 
 client = TestClient(app)
 

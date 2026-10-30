@@ -2,19 +2,19 @@
 
 用法：
     # 给既有学生签发（按 students.id）
-    ./.venv/bin/python prep/mcp_token.py issue --student-id 3 --label 小明
+    ./.venv/bin/python ops/mcp_token.py issue --student-id 3 --label 小明
 
-    # 新学生 + 签发一步完成（名字会带日期后缀避免 UNIQUE 冲突时手动处理）
-    ./.venv/bin/python prep/mcp_token.py issue --new-student 小明
+    # 新学生 + 签发一步完成
+    ./.venv/bin/python ops/mcp_token.py issue --new-student 小明
 
-    # 教师聚合 Token（class_summary 可用）
-    ./.venv/bin/python prep/mcp_token.py issue --student-id 3 --label teacher-班主任 --teacher
+    # 教师聚合 Token（class_summary 可用；v1.3 起走正式 role 列）
+    ./.venv/bin/python ops/mcp_token.py issue --student-id 3 --label 班主任 --role teacher
 
     # 吊销（学生退班/泄露）
-    ./.venv/bin/python prep/mcp_token.py revoke --token ck_xxx
+    ./.venv/bin/python ops/mcp_token.py revoke --token ck_xxx
 
     # 列出
-    ./.venv/bin/python prep/mcp_token.py list
+    ./.venv/bin/python ops/mcp_token.py list
 
 安全：明文 Token 只在签发时打印一次，库里只存 SHA-256。
 """
@@ -23,11 +23,10 @@ import hashlib
 import secrets
 import sys
 import os
-from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import db  # noqa: E402
+from gateway import db  # noqa: E402
 
 
 def _new_token() -> str:
@@ -51,16 +50,16 @@ def cmd_issue(ns):
     else:
         sys.exit("需要 --student-id 或 --new-student")
 
+    role = "teacher" if ns.role == "teacher" else "student"
     raw = _new_token()
     label = ns.label or ""
-    if ns.teacher and "teacher" not in label.lower():
-        label = f"teacher-{label}" if label else "teacher"
-    key_id = db.issue_api_key(student_id, _hash(raw), label=label)
+    key_id = db.issue_api_key(student_id, _hash(raw), label=label, role=role)
     print("=" * 56)
     print(f"key_id      : {key_id}")
     print(f"student_id  : {student_id}")
     print(f"label       : {label or '-'}")
-    print(f"rate_limit  : 120 次/小时")
+    print(f"role        : {role}")
+    print(f"rate_limit  : 120 次/小时（仅业务调用 tools/call 计费）")
     print(f"TOKEN(只显示一次): {raw}")
     print("=" * 56)
     print("请立即复制保存。库中仅存 SHA-256 哈希，遗失只能吊销重签。")
@@ -75,8 +74,8 @@ def cmd_list(ns):
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT k.id, k.student_id, k.label, k.created_at, k.last_used_at,"
-                " k.revoked_at, s.name"
+                "SELECT k.id, k.student_id, k.label, k.role, k.created_at,"
+                " k.last_used_at, k.revoked_at, s.name"
                 " FROM api_keys k LEFT JOIN students s ON s.id=k.student_id"
                 " ORDER BY k.id DESC LIMIT 100")
             rows = cur.fetchall()
@@ -87,8 +86,8 @@ def cmd_list(ns):
         status = "REVOKED" if r["revoked_at"] else "active"
         used = r["last_used_at"] or "never"
         print(f"#{r['id']} student={r['student_id']}({r['name']}) "
-              f"label={r['label'] or '-'} {status} used={used} "
-              f"created={r['created_at']}")
+              f"role={r.get('role', '?')} label={r['label'] or '-'} {status} "
+              f"used={used} created={r['created_at']}")
 
 
 def main():
@@ -99,7 +98,8 @@ def main():
     pi.add_argument("--student-id", type=int)
     pi.add_argument("--new-student", type=str)
     pi.add_argument("--label", type=str, default="")
-    pi.add_argument("--teacher", action="store_true")
+    pi.add_argument("--role", choices=["student", "teacher"], default="student",
+                    help="v1.3 RBAC：正式权限角色（默认 student）")
     pi.set_defaults(fn=cmd_issue)
 
     pr = sub.add_parser("revoke")
