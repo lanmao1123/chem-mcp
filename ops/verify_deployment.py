@@ -47,6 +47,8 @@ def sha256_file(path: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="生产部署逐文件哈希对账")
+    ap.add_argument("manifest_pos", nargs="?", default=None,
+                    help="manifest 路径（位置参数写法，等价 --manifest）")
     ap.add_argument("--manifest", default="build_manifest.json")
     ap.add_argument("--root", default=".", help="服务器上发布文件的根目录")
     ap.add_argument("--map-file", default=None,
@@ -54,6 +56,8 @@ def main():
     ap.add_argument("--strict-missing", action="store_true",
                     help="所有缺失文件一律 FAIL（默认未部署文件记 SKIP）")
     args = ap.parse_args()
+    if args.manifest_pos:
+        args.manifest = args.manifest_pos
 
     if not os.path.isfile(args.manifest):
         print(f"[FAIL] manifest 不存在：{args.manifest}")
