@@ -15,6 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # --verify 需要 manifest 指向的 release_commit（HEAD 的父提交）做 blob 对账，
+          # 浅克隆（默认 depth=1）会导致 release_commit 不存在而误报
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
