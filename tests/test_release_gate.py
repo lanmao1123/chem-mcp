@@ -475,6 +475,21 @@ def test_verify_release_not_ancestor(tmp_path):
     assert any("祖先" in p for p in problems)
 
 
+def test_verify_workflow_modified_after_release_allowed(tmp_path):
+    """release 后只改 CI workflow（白名单内）→ PASS"""
+    repo, release, mrel = _make_two_stage_repo(tmp_path)
+    wdir = pathlib.Path(repo) / ".github" / "workflows"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "release-gate.yml").write_text("name: changed\n", encoding="utf-8")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "add", "-A"], cwd=repo, env=env, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "ci tweak"], cwd=repo, env=env,
+                   capture_output=True)
+    problems = sync.verify_release(repo, mrel, sync.CURRENT_VERSION)
+    assert problems == [], problems
+
+
 def test_verify_gateway_modified_after_release(tmp_path):
     """release 后修改 gateway → 两段式检查 FAIL"""
     repo, release, mrel = _make_two_stage_repo(tmp_path)
@@ -486,7 +501,7 @@ def test_verify_gateway_modified_after_release(tmp_path):
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "late"], cwd=repo, check=True, env=env)
     problems = sync.verify_release(repo, mrel, sync.CURRENT_VERSION)
-    assert any("非 manifest" in p for p in problems)
+    assert any("非白名单" in p for p in problems)
 
 
 def test_verify_readme_modified_after_release(tmp_path):
@@ -499,7 +514,7 @@ def test_verify_readme_modified_after_release(tmp_path):
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "late"], cwd=repo, check=True, env=env)
     problems = sync.verify_release(repo, mrel, sync.CURRENT_VERSION)
-    assert any("非 manifest" in p for p in problems)
+    assert any("非白名单" in p for p in problems)
 
 
 def test_verify_worktree_dirty(tmp_path):

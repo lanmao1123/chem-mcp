@@ -188,7 +188,7 @@ WHERE student_id=%s AND version=%s    -- rowcount==0 → 冲突
    - `notifications/initialized`（无 id 通知）必须返回 202 空体（返回 400 会让客户端中断握手陷入重连循环）；
    - 短流 SSE 会触发 3 秒重连风暴，需长流 + 心跳。
    官方 SDK 对这些边缘行为（尤其非标准客户端的容错）是黑盒；手写层让我们在 10 分钟内定位并修复每一次故障，修复版本当天上线。
-2. **协议面极小**。本网关只需 `initialize` / `tools/list` / `tools/call` / notifications 四个方法，无 resources/prompts/sampling 等能力。手写面 ≈ 60 行路由代码，且有 84 个测试用例锁定行为（含发布门禁回归测试）。
+2. **协议面极小**。本网关只需 `initialize` / `tools/list` / `tools/call` / notifications 四个方法，无 resources/prompts/sampling 等能力。手写面 ≈ 60 行路由代码，且有 85 个测试用例锁定行为（含发布门禁回归测试）。
 3. **迁移路径已预留**。`_TOOL_IMPL` 字典是唯一的工具注册点，协议层与工具层完全解耦——若后续需要官方 SDK（例如要兼容更多 MCP 宿主），只需替换路由层，9 个工具实现零改动。
 
 **诚实的定位声明**：本项目是 *MCP-compatible data gateway for a specific production client*，不是 *reference MCP server implementation*。若你的目标是后者，请以官方 SDK 为准——这也是我们 README 不宣称"标准 MCP 实现"的原因。
@@ -215,7 +215,7 @@ MySQL              = 状态层：唯一真相
 | 6 | 教师Token与学生Token同表，scope 粒度=role 二值 | 满足当前 | 引入 scopes 列（student:read / class:read） |
 | 7 | 无请求链路 tracing id | 日志有 key_id+工具名 | 加 X-Request-Id 透传 |
 | 8 | 重名学生经 create_student 可能共享 student_id（INSERT IGNORE 按名幂等） | 试点期人工对名单兜底 | **P1**：签发流程改 user_id 映射，姓名仅展示 |
-| 9 | 测试依赖真实 MySQL；CI 未强制 | v1.8 已加 `.github/workflows/release-gate.yml`（语法/AST/动态对账/`--verify` + MySQL 8 service container 集成测试，隔离库不吃生产凭据）；84 用例本地与 CI 双跑 | **P1 剩余**：branch protection / required status check 属仓库设置，须管理员手工开启（代码无法自我强制）；开启前"直接 cp + commit 绕过脚本"仍不可被仓库侧阻止 |
+| 9 | 测试依赖真实 MySQL；CI 未强制 | v1.8 已加 `.github/workflows/release-gate.yml`（语法/AST/动态对账/`--verify` + MySQL 8 service container 集成测试，隔离库不吃生产凭据）；85 用例本地与 CI 双跑 | **P1 剩余**：branch protection / required status check 属仓库设置，须管理员手工开启（代码无法自我强制）；开启前"直接 cp + commit 绕过脚本"仍不可被仓库侧阻止 |
 | 10 | dialogue_log 写入无独立幂等键 | 低危（摘要重复无资损） | **P1**：统一 operation_id 幂等框架 |
 | 11 | class_summary 无班级边界（teacher 见全表） | 试点期教师=管理员 | **P1**：teacher_classes 关联 + 查询强制带边界 |
 | 12 | ~~Memory 首建档（ver=None）并发首写无版本保护~~ | **v1.7 已修复**：无行按 version=1 统一走原子建行+条件更新，见 §5t.3 | 关闭（并发测试锁定） |
@@ -238,7 +238,7 @@ MySQL              = 状态层：唯一真相
 | 4 | Expert Prompt 与工具 schema 不一致（save_memory 无 target_grade 参数；报告存档话术提前） | ✅ 属实 | **已修**：提示词明确"目标等级/分数段/卷型变化走 update_profile"；报告存档流程改为"save_report 成功后才宣称" |
 | 5 | 重名学生 create_student INSERT IGNORE 返回同一 student_id → 数据串号 | ✅ 属实（schema 已有 user_id 列但签发流程未用） | **列入 P1**（需要业务层注册流程配合，见路线图 #8）；当前试点用"报名字+教师对名单"人工兜底 |
 | 6 | class_summary 无班级权限边界，teacher 可看全表 | ✅ 属实（设计如此） | **列入 P1**（路线图 #6：teacher_classes 关联表）；试点期教师=管理员，文档已声明 |
-| 7 | 测试依赖真实 MySQL / 缺 CI | ✅ 属实 | **列入 P1**（路线图 #9）；v1.5–v1.6 时期 37 用例跑真实库（本地隧道），单测/集成分离与 GitHub Actions 待加（截至 v1.8 为 84 例，含发布门禁回归测试） |
+| 7 | 测试依赖真实 MySQL / 缺 CI | ✅ 属实 | **列入 P1**（路线图 #9）；v1.5–v1.6 时期 37 用例跑真实库（本地隧道），单测/集成分离与 GitHub Actions 待加（截至 v1.8 为 85 例，含发布门禁回归测试） |
 | 8 | 对话摘要无独立幂等键 | ✅ 属实（低危） | **列入 P1**（统一 operation_id 方案，见路线图 #10） |
 
 ### v1.4 后的工具全景（9 个）
@@ -294,7 +294,7 @@ COMMIT;                                     -- 释放锁，后续请求可见已
 
 三轮时修正了评审指定的 7 处位置（README"8 个白名单工具"→9、"30 个测试"→37、DESIGN §2/§3.8/§8 三处 30→37、网关模块 docstring"7 个工具/app.db"→"9 个工具/db.py"），§5 限流行表述已更正为诚实版本（不再声称 v1.4 已完成原子限流）。**但四轮复查证明"指定位置修正"不等于"全仓库一致"**——README 徽章、README 目录注释、DESIGN 路线图等未列入清单的位置仍残留 33/v1.4/旧启动命令。教训已固化为机制：文档对账不靠人工清单，靠 `sync_from_chemask.py` 的全量模式扫描（见 §5ter），扫描规则与版本号同步演进。
 
-**关于"生产-仓库逐字节一致"的验证方式**：评审正确指出其无法独立验证。我们的对账方式是 `diff` 本地两份文件 + 在仓库布局下跑完整测试套件（v1.5 时 37/37 于 chem-mcp/ 目录通过；当前基线 84 用例）。CI 落地前，这是人工流程；路线图 #9 的 GitHub Actions 即为此而设。
+**关于"生产-仓库逐字节一致"的验证方式**：评审正确指出其无法独立验证。我们的对账方式是 `diff` 本地两份文件 + 在仓库布局下跑完整测试套件（v1.5 时 37/37 于 chem-mcp/ 目录通过；当前基线 85 用例）。CI 落地前，这是人工流程；路线图 #9 的 GitHub Actions 即为此而设。
 
 ---
 
@@ -388,7 +388,7 @@ db 层 `expected_version` 路径本身已是原子的：`INSERT IGNORE INTO stud
 
 ## 5quin. 六轮评审修复记录（v1.8，2026-10-30）
 
-第六轮审查结论"有条件放行"，并要求本轮一次性修完发布门禁与并发边界。本轮改动量最大的是**把门禁自身变成被测对象**（新增 `tests/test_release_gate.py`，46 例）。逐项如下：
+第六轮审查结论"有条件放行"，并要求本轮一次性修完发布门禁与并发边界。本轮改动量最大的是**把门禁自身变成被测对象**（新增 `tests/test_release_gate.py`，47 例）。逐项如下：
 
 ### 5qn.1 扫描豁免：章节编号前缀 → H2 标题精确匹配
 
@@ -447,7 +447,7 @@ v1.7 的测试 Barrier 在请求入口，只能保证同时开始，不能保证
 
 ### 5qn.9 本轮测试基线变化
 
-新增 `tests/test_release_gate.py`（46 例）后，总基线从 38 → **84**。README 徽章、README 目录说明、DESIGN §3.8/§8/§4 现状描述、`CURRENT_TESTS` 全部同步；历史章节中 v1.5/v1.6/v1.7 的 37/38 保留并标注所属版本。
+新增 `tests/test_release_gate.py`（47 例）后，总基线从 38 → **85**。README 徽章、README 目录说明、DESIGN §3.8/§8/§4 现状描述、`CURRENT_TESTS` 全部同步；历史章节中 v1.5/v1.6/v1.7 的 37/38 保留并标注所属版本。
 
 ---
 
@@ -533,7 +533,7 @@ chem-mcp/
 │   └── verify_deployment.py # 生产部署逐文件 SHA-256 对账（六轮新增）
 ├── tests/
 │   ├── test_mcp_gateway.py   # 38 例（本文件）：协议/鉴权/吊销/限流语义(含并发)/并发幂等/JSON 合法性与硬上限/乐观锁/并发首建档/RBAC
-│   └── test_release_gate.py  # 46 例（本文件）：发布门禁回归测试（章节豁免/动态对账/AST 扫描/manifest 临时仓库/.env 注入）
+│   └── test_release_gate.py  # 47 例（本文件）：发布门禁回归测试（章节豁免/动态对账/AST 扫描/manifest 临时仓库/.env 注入）
 ├── DESIGN.md             # 本文档
 └── README.md             # 快速概览
 ```

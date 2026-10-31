@@ -62,10 +62,13 @@ MANIFEST_FILES = [
 # 明确不纳入 manifest 的文件及原因（写入文档，避免"漏项"争议）：
 #   build_manifest.json —— 自引用
 #   .github/workflows/release-gate.yml —— CI 配置，非部署产物；其正确性由 CI 自身运行验证
+# 两段式发布允许的差异文件：manifest 固化提交本身 + CI 配置（审查/修复 workflow 属发布流程的一部分，
+# 不涉及业务发布文件内容）
+TWO_STAGE_ALLOWED_DIFF = {"build_manifest.json", ".github/workflows/release-gate.yml"}
 
 # ── 版本基线（升级版本时必须同步更新此处 + README 徽章 + DESIGN 头部 + 全部文档）──
 CURRENT_VERSION = "1.8"
-CURRENT_TESTS = 84          # 38 (test_mcp_gateway.py) + 46 (test_release_gate.py)
+CURRENT_TESTS = 85          # 38 (test_mcp_gateway.py) + 47 (test_release_gate.py)
 CURRENT_TOOLS = ["get_profile", "update_profile", "save_memory", "record_attempt",
                  "list_mistakes", "get_mastery", "class_summary", "get_report",
                  "save_report"]
@@ -663,8 +666,9 @@ def verify_release(repo: str, manifest_rel: str, version: str) -> list:
     # F. 两段式发布：release..HEAD 只允许 build_manifest.json
     if release and _git(repo, "cat-file", "-t", release) == "commit" and release != head:
         changed = set(_git(repo, "diff", "--name-only", release, head).splitlines())
-        if changed != {manifest_rel}:
-            problems.append(f"release_commit 后修改了非 manifest 文件：{sorted(changed)}")
+        if changed - TWO_STAGE_ALLOWED_DIFF:
+            problems.append(f"release_commit 后修改了非白名单文件（业务发布文件漂移）："
+                            f"{sorted(changed - TWO_STAGE_ALLOWED_DIFF)}")
     # G. release_commit 的 git blob 哈希逐文件比对
     for rel, expected in m["files"].items():
         if not re.fullmatch(r"[0-9a-f]{64}", expected):
